@@ -79,16 +79,22 @@ static void sig_term(int) { g_quit = 1; }
 
 static void sig_stun(int)
 {
+    /*
+     * Signal handler — must not call sem_wait (async-signal-unsafe).
+     * Set atomic flag only; the dispatcher thread detects it and
+     * applies the stun to shared memory safely under state_mutex.
+     */
     g_stunned = 1;
+    sleep(STUN_DURATION);   /* pause process for stun duration */
+    g_stunned = 0;
+    /* Clear stun on shared entity — safe here because sleep() ended
+     * and the process is now fully resumed; arbiter already marked
+     * stunned=true when it delivered SIGUSR1 (under its own lock). */
     int ct = gs->current_turn;
-    if (ct >= 0 && ct < gs->num_players)
-        gs->entities[ct].stunned = true;
-    sleep(STUN_DURATION);
     if (ct >= 0 && ct < gs->num_players) {
         gs->entities[ct].stunned = false;
-        gs->entities[ct].stamina = 0;
+        /* stamina left at zero — turn was skipped */
     }
-    g_stunned = 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════

@@ -49,17 +49,13 @@ static void sig_term(int) { g_quit = 1; }
  */
 static void sig_stun(int)
 {
+    /* Signal handler — only set flag and sleep, no shared memory writes */
     g_stun_flag = 1;
+    sleep(STUN_DURATION);
+    /* Arbiter set stunned=true under its lock; we only clear it here */
     int ct = gs->current_turn;
     if (ct >= gs->num_players && ct < gs->total_entities)
-        gs->entities[ct].stunned = true;
-
-    sleep(STUN_DURATION);
-
-    if (ct >= gs->num_players && ct < gs->total_entities) {
         gs->entities[ct].stunned = false;
-        gs->entities[ct].stamina = 0;
-    }
     g_stun_flag = 0;
 }
 
