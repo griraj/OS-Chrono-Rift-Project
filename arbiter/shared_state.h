@@ -127,6 +127,9 @@ struct Entity {
     bool       action_ready = false;   /* set by hip/asp after writing action */
     bool       action_done  = false;   /* set by arbiter after consuming */
 
+    /* Swap-In cooldown: weapon swapped in this turn cannot be used until next turn */
+    int        swap_in_slot = -1;      /* slot of weapon just swapped in (-1 = none) */
+
     char       last_log[128] = {};
 };
 

@@ -108,8 +108,7 @@ static void init_player(Entity& e, int idx, int num_players,
     e.max_stamina = 100;
     e.stamina     = 0.0f;
     e.alive       = true;
-    // Every player starts with a Splinter Stick so Use Weapon is available
-    inv_pickup(e, WPN_SPLINTER_STICK);
+    e.swap_in_slot = -1;
 }
 
 static void init_enemy(Entity& e, int idx, unsigned roll_no,
@@ -126,6 +125,7 @@ static void init_enemy(Entity& e, int idx, unsigned roll_no,
     e.max_stamina = 150;
     e.stamina     = 0.0f;
     e.alive       = true;
+    e.swap_in_slot = -1;
     // 50% chance enemy carries a non-artifact weapon (won't drop on death per spec)
     static const WeaponID ENEMY_WPNS[] = {
         WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_FROSTBOW,
@@ -216,6 +216,12 @@ static void apply_action(int actor_idx, const Action& act)
         break;
     }
     case ActionType::USE_WEAPON: {
+        // Spec: weapon swapped in THIS turn cannot be used until next turn
+        if (actor.swap_in_slot >= 0 && actor.swap_in_slot == act.weapon_slot) {
+            snprintf(buf, sizeof(buf),
+                "%s cannot use just-swapped weapon this turn!", actor.name);
+            actor.stamina = 0; break;
+        }
         Entity& tgt = gs->entities[act.target_idx];
         WeaponID wid = actor.inventory.slots[act.weapon_slot];
         int dmg = weapon_def(wid).damage;
@@ -244,7 +250,14 @@ static void apply_action(int actor_idx, const Action& act)
     }
     case ActionType::SWAP_IN: {
         inv_swap_in(actor, act.swap_wpn);
-        snprintf(buf, sizeof(buf), "%s swaps in %s from LTS (costs turn)",
+        // Spec: cannot use swapped-in weapon until NEXT turn
+        actor.swap_in_slot = -1;
+        for (int s = 0; s < INVENTORY_SLOTS; ++s) {
+            if (actor.inventory.slots[s] == act.swap_wpn &&
+                inv_first_slot_of(actor.inventory, s) == s)
+                { actor.swap_in_slot = s; break; }
+        }
+        snprintf(buf, sizeof(buf), "%s swaps in %s (usable next turn)",
                  actor.name, weapon_def(act.swap_wpn).name);
         actor.stamina = 0;
         break;
@@ -408,6 +421,7 @@ static void arbiter_main_loop()
         gs->npc_submitted      = false;
         actor.action_ready     = false;
         actor.action_done      = false;
+        actor.swap_in_slot     = -1;  // cooldown expires — weapon now usable
         sem_post(&gs->state_mutex);
 
         // Post to the correct process only
@@ -451,28 +465,35 @@ static void arbiter_main_loop()
         if (ultimate_triggered) trigger_ultimate(ready);
         if (stun_triggered)     deliver_stun(act.target_idx);
 
-        for (int i = gs->num_players; i < gs->total_entities; ++i) {
+        for (int i = gs->num_players; i < gs->total_entities; ++i)
+        {
             Entity& en = gs->entities[i];
-            if (!en.alive && en.stamina >= 0.0f) {
+
+            if (!en.alive && en.stamina >= 0.0f)
+            {
                 char buf[128];
                 snprintf(buf, sizeof(buf), "%s has been defeated!", en.name);
                 game_log(buf);
                 en.stamina = -1.0f;
 
-                // Weapon drop: find a non-artifact weapon the enemy held
-                // (spec: enemy-carried weapons are NOT dropped — only world drops)
-                // We generate a fresh random drop instead (50% chance)
+                // Spec s10: NPC-held weapons are NOT dropped on death.
+                // Only generate a world drop if enemy held nothing (50% chance).
                 static const WeaponID DROP_TABLE[] = {
                     WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_IRON_HALBERD,
                     WPN_FROSTBOW, WPN_OBSIDIAN_AXE, WPN_THUNDERSTAFF
+                    // Eclipse Relic excluded — dynamic artifact, not a drop
                 };
-                if (rng_range(g_seed, 0, 1) == 1 &&
-                    gs->pending_drop_ready == false) {
-                    // Offer drop to the player who dealt the killing blow
-                    // (use actor_idx captured from outer scope)
-                    int offer_to = ready; // entity that just acted
+                bool enemy_held = false;
+                for (int s2 = 0; s2 < INVENTORY_SLOTS; ++s2)
+                    if (en.inventory.slots[s2] != WPN_NONE)
+                        { enemy_held = true; break; }
+
+                if (!enemy_held &&
+                    rng_range(g_seed, 0, 1) == 1 &&
+                    gs->pending_drop_ready == false)
+                {
+                    int offer_to = ready;
                     if (gs->entities[offer_to].type != EntityType::PLAYER) {
-                        // find first alive player
                         offer_to = 0;
                         for (int p = 0; p < gs->num_players; ++p)
                             if (gs->entities[p].alive) { offer_to = p; break; }
@@ -495,15 +516,19 @@ static void arbiter_main_loop()
                     struct timespec dl{};
                     clock_gettime(CLOCK_REALTIME, &dl);
                     dl.tv_sec += 30; // 30 s to decide
-                    while (!gs->pending_drop_done) {
-                        struct timespec ns{0, 20000000};
+
+                    while (!gs->pending_drop_done)
+                    {
+                        struct timespec ns { 0, 20000000 };
                         nanosleep(&ns, nullptr);
                         struct timespec now{};
                         clock_gettime(CLOCK_REALTIME, &now);
+
                         if (now.tv_sec >= dl.tv_sec) break;
                     }
 
-                    if (gs->pending_drop_taken) {
+                    if (gs->pending_drop_taken)
+                    {
                         inv_pickup(gs->entities[offer_to], drop);
                         snprintf(buf, sizeof(buf), "%s picked up %s!",
                                  gs->entities[offer_to].name, weapon_def(drop).name);

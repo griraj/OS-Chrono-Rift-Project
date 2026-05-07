@@ -125,18 +125,18 @@ chrono_rift/
 ├── Makefile
 ├── README.md
 ├── arbiter/
-│   ├── arbiter.cpp        ← Arbiter + SFML renderer (modified)
-│   ├── main_launcher.cpp  ← Entry point, prompts and execs arbiter_main()
+│   ├── arbiter.cpp       
+│   ├── main_launcher.cpp  
 │   ├── inventory.h
 │   ├── inventory.cpp
-│   └── shared_state.h     ← Single source of truth for shared memory layout
+│   └── shared_state.h    
 ├── hip/
-│   ├── hip.cpp            ← Human Interface Process (unchanged)
+│   ├── hip.cpp            
 │   ├── inventory.h
 │   ├── inventory.cpp
 │   └── shared_state.h
 └── asp/
-    ├── asp.cpp            ← Automated Strategic Process (unchanged)
+    ├── asp.cpp            
     ├── inventory.h
     ├── inventory.cpp
     └── shared_state.h

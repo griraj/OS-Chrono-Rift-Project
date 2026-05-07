@@ -506,19 +506,26 @@ static Action show_action_window(int pidx, const sf::Font& font)
             }
         } else if(state==St::WEAPON){
             for(auto& wb:wbtns){
-                sf::Color fill=wb.hov?sf::Color{15,25,55}:C_PANEL;
-                sf::Color bord=wb.hov?C_BORDER_HI:C_BORDER;
+                // Grey out weapon that was just swapped in (unusable this turn)
+                bool locked = (me.swap_in_slot >= 0 && me.swap_in_slot == wb.slot);
+                sf::Color fill = locked ? sf::Color{20,15,15}
+                                : wb.hov ? sf::Color{15,25,55} : C_PANEL;
+                sf::Color bord = locked ? sf::Color{80,40,40}
+                                : wb.hov ? C_BORDER_HI : C_BORDER;
                 draw_box(win,wb.b.left,wb.b.top,wb.b.width,wb.b.height,fill,bord,wb.hov?2.f:1.5f);
-                if(wb.hov){sf::RectangleShape bar({3.f,wb.b.height-8.f});
+                if(!locked && wb.hov){sf::RectangleShape bar({3.f,wb.b.height-8.f});
                     bar.setPosition(wb.b.left+4.f,wb.b.top+4.f);
                     bar.setFillColor(C_ACCENT); win.draw(bar);}
                 std::ostringstream ws;
                 ws<<weapon_def(wb.wid).name<<"  dmg "<<weapon_def(wb.wid).damage
                   <<"  ["<<weapon_def(wb.wid).slots<<" slots]";
-                auto lt=mkt(font,ws.str(),15,wb.hov?C_WHITE:sf::Color{160,170,190},wb.hov);
+                if(locked) ws<<" (next turn only)";
+                sf::Color txtCol = locked ? sf::Color{100,70,70}
+                                 : wb.hov ? C_WHITE : sf::Color{160,170,190};
+                auto lt=mkt(font,ws.str(),15,txtCol,wb.hov&&!locked);
                 lt.setPosition(wb.b.left+14.f,wb.b.top+7.f); win.draw(lt);
                 std::ostringstream ss2; ss2<<"slot "<<wb.slot;
-                auto st=mkt(font,ss2.str(),11,wb.hov?C_ACCENT:C_DIM);
+                auto st=mkt(font,ss2.str(),11,locked?sf::Color{80,50,50}:wb.hov?C_ACCENT:C_DIM);
                 st.setPosition(wb.b.left+14.f,wb.b.top+wb.b.height-18.f); win.draw(st);
             }
             auto bk=mkt(font,"ESC to go back",11,C_DIM); bk.setPosition(34.f,by+10.f); win.draw(bk);
