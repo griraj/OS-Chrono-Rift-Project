@@ -1,25 +1,3 @@
-/*
- * arbiter.cpp  –  Game Arbiter Process (produces 'arbiter_bin')
- *
- * Responsibilities:
- *  - Creates and owns the POSIX shared memory segment
- *  - Initialises all entities with roll-number-seeded stats
- *  - Runs the stamina-based scheduler (1 s ticks)
- *  - Enforces serial action execution
- *  - Applies all actions and updates game state
- *  - Spawns hip and asp child processes
- *  - Spawns the SFML rendering thread (replaces ncurses)
- *  - Delivers SIGUSR1 (stun) to target process
- *  - Sends SIGSTOP/SIGCONT to asp for Ultimate pause (10 s via SIGALRM)
- *  - Handles SIGTERM (quit from hip)
- *  - Runs background deadlock-monitor thread
- *  - Manages process lifecycle (wait/reap children on game over)
- *
- * SFML NOTE:
- *  SFML windows MUST be created and used exclusively from the thread that
- *  owns them. The rendering thread therefore creates the sf::RenderWindow
- *  itself. The main/game threads never touch it.
- */
 
 #include <cstdio>
 #include <cstdlib>
