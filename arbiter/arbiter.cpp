@@ -167,6 +167,14 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
         init_enemy(gs->entities[num_players + i], num_players + i,
                    roll_no, g_seed, i);
 
+    /* Lifecycle tracking queues — populated immediately */
+    gs->num_active_players = 0;
+    gs->num_active_enemies = 0;
+    for (int i = 0; i < num_players; ++i)
+        gs->active_players[gs->num_active_players++] = i;
+    for (int i = 0; i < num_enemies; ++i)
+        gs->active_enemies[gs->num_active_enemies++] = num_players + i;
+
     /* Artifact table */
     gs->artifacts[0] = {WPN_SOLAR_CORE,    ArtifactState::FREE, -1, true };
     gs->artifacts[1] = {WPN_LUNAR_BLADE,   ArtifactState::FREE, -1, true };
@@ -182,6 +190,38 @@ static void game_log(const char* msg)
     gs->log[h][LOG_LINE_LEN - 1] = '\0';
     gs->log_head = (h + 1) % LOG_LINES;
     sem_post(&gs->log_mutex);
+}
+
+/* ── Update lifecycle tracking queues (spec s2) ─────────────────── */
+static void remove_from_tracking(int entity_idx)
+{
+    const Entity& e = gs->entities[entity_idx];
+    if (e.type == EntityType::PLAYER) {
+        for (int i = 0; i < gs->num_active_players; ++i) {
+            if (gs->active_players[i] == entity_idx) {
+                /* Shift remaining entries left */
+                for (int j = i; j < gs->num_active_players - 1; ++j)
+                    gs->active_players[j] = gs->active_players[j+1];
+                --gs->num_active_players;
+                break;
+            }
+        }
+    } else {
+        for (int i = 0; i < gs->num_active_enemies; ++i) {
+            if (gs->active_enemies[i] == entity_idx) {
+                for (int j = i; j < gs->num_active_enemies - 1; ++j)
+                    gs->active_enemies[j] = gs->active_enemies[j+1];
+                --gs->num_active_enemies;
+                break;
+            }
+        }
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "[Lifecycle] %s removed from tracking queue (active p=%d e=%d)",
+             gs->entities[entity_idx].name,
+             gs->num_active_players, gs->num_active_enemies);
+    game_log(buf);
 }
 
 /* ── Apply action ─────────────────────────────────────────────────── */
@@ -203,6 +243,7 @@ static void apply_action(int actor_idx, const Action& act)
         if (tgt.hp <= 0) {
             tgt.hp = 0; tgt.alive = false;
             if (tgt.type == EntityType::ENEMY) ++gs->enemies_killed;
+            remove_from_tracking(act.target_idx);
         }
         break;
     }
@@ -232,6 +273,7 @@ static void apply_action(int actor_idx, const Action& act)
         if (tgt.hp <= 0) {
             tgt.hp = 0; tgt.alive = false;
             if (tgt.type == EntityType::ENEMY) ++gs->enemies_killed;
+            remove_from_tracking(act.target_idx);
         }
         break;
     }
@@ -244,6 +286,7 @@ static void apply_action(int actor_idx, const Action& act)
             tgt.hp -= weapon_def(WPN_SOLAR_CORE).damage + weapon_def(WPN_LUNAR_BLADE).damage;
             if (tgt.hp <= 0) {
                 tgt.hp = 0; tgt.alive = false; ++gs->enemies_killed;
+                remove_from_tracking(gs->num_players + (int)(&tgt - &gs->entities[gs->num_players]));
             }
         }
         break;

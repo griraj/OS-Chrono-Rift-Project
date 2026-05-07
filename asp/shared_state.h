@@ -163,6 +163,15 @@ struct SharedState {
     bool        turn_ready     = false;
     bool        npc_submitted  = false;
 
+    /* ── Lifecycle tracking queues (spec s2: Lifecycle Management) ──
+     * active_players / active_enemies track which entity indices are
+     * still alive. Arbiter updates these immediately when an entity dies.
+     * hip and asp can read them to know which channels are still open. */
+    int  active_players[MAX_PLAYERS];   /* entity indices of alive players */
+    int  num_active_players = 0;
+    int  active_enemies[MAX_ENEMIES];   /* entity indices of alive enemies */
+    int  num_active_enemies = 0;
+
     /* Artifacts */
     ArtifactEntry artifacts[NUM_ARTIFACTS];
 
