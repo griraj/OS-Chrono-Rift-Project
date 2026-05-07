@@ -3,11 +3,11 @@
  *
  * Threading architecture (OS requirement preserved):
  *  - One pthread per player  (player_thread[0..N-1])
- *  - One dispatcher pthread  (watches gs->turn_sem, wakes active player)
+ *  - One dispatcher pthread  (watches gs->hip_turn_sem, wakes active player)
  *  - Main thread owns ALL SFML windows (X11/Mesa requires this on WSL2)
  *
  * Flow per turn:
- *  1. Arbiter posts turn_sem  →  dispatcher wakes player_sem[i]
+ *  1. Arbiter posts hip_turn_sem  →  dispatcher wakes player_sem[i]
  *  2. player_thread[i] wakes, sets g_ui_request = {pidx, ...}
  *  3. player_thread[i] waits on g_ui_done semaphore
  *  4. Main thread sees g_ui_request, opens SFML window, collects action
@@ -187,6 +187,91 @@ static void draw_scanlines(sf::RenderTarget& rt)
     for(unsigned y=0;y<UI_H;y+=4){l.setPosition(0,static_cast<float>(y));rt.draw(l);}
 }
 
+
+/* ════════════════════════════════════════════════════════════════════
+ * show_drop_window()
+ * Called from main thread when arbiter signals a weapon drop.
+ * Shows a YES / NO prompt. Returns true if player picks up the weapon.
+ * ════════════════════════════════════════════════════════════════════ */
+static bool show_drop_window(WeaponID drop_wpn, int player_idx, const sf::Font& font)
+{
+    const Entity& me = gs->entities[player_idx];
+    std::string wname = weapon_def(drop_wpn).name;
+
+    sf::RenderWindow win(sf::VideoMode(500, 260),
+                         "Weapon Drop!",
+                         sf::Style::Titlebar | sf::Style::Close);
+    win.setFramerateLimit(60);
+    sf::Clock clk;
+
+    sf::FloatRect yes_b = {60.f,  180.f, 160.f, 48.f};
+    sf::FloatRect no_b  = {280.f, 180.f, 160.f, 48.f};
+
+    while (win.isOpen()) {
+        sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
+        float t = clk.getElapsedTime().asSeconds();
+        (void)t;
+
+        sf::Event ev{};
+        while (win.pollEvent(ev)) {
+            if (ev.type == sf::Event::Closed)        { win.close(); return false; }
+            if (ev.type == sf::Event::KeyPressed) {
+                if (ev.key.code == sf::Keyboard::Y)  { win.close(); return true;  }
+                if (ev.key.code == sf::Keyboard::N)  { win.close(); return false; }
+                if (ev.key.code == sf::Keyboard::Return){ win.close(); return true; }
+                if (ev.key.code == sf::Keyboard::Escape){ win.close(); return false;}
+            }
+            if (ev.type == sf::Event::MouseButtonPressed &&
+                ev.mouseButton.button == sf::Mouse::Left) {
+                if (yes_b.contains(ms)) { win.close(); return true;  }
+                if (no_b.contains(ms))  { win.close(); return false; }
+            }
+        }
+
+        win.clear(C_BG);
+
+        // Title
+        auto title = mkt(font, "WEAPON DROP!", 24, C_GOLD, true);
+        draw_centered(win, title, 250.f, 18.f);
+
+        sf::RectangleShape rule({460.f, 1.f});
+        rule.setPosition(20.f, 52.f); rule.setFillColor(C_BORDER); win.draw(rule);
+
+        // Weapon info
+        std::string line1 = wname + "  (dmg " +
+                            std::to_string(weapon_def(drop_wpn).damage) + ", " +
+                            std::to_string(weapon_def(drop_wpn).slots) + " slots)";
+        auto wt = mkt(font, line1, 17, C_ACCENT);
+        draw_centered(win, wt, 250.f, 68.f);
+
+        std::string line2 = std::string(me.name) + ", do you want to pick it up?";
+        auto qt = mkt(font, line2, 14, C_WHITE);
+        draw_centered(win, qt, 250.f, 100.f);
+
+        auto hint = mkt(font, "Y / Enter = Yes     N / Esc = No", 12, C_DIM);
+        draw_centered(win, hint, 250.f, 124.f);
+
+        // YES button
+        bool yes_hov = yes_b.contains(ms);
+        draw_box(win, yes_b.left, yes_b.top, yes_b.width, yes_b.height,
+                 yes_hov ? sf::Color{10,60,20} : C_PANEL,
+                 yes_hov ? C_GREEN : C_BORDER, yes_hov ? 2.f : 1.5f);
+        auto yt = mkt(font, "YES  (Y)", 18, yes_hov ? C_GREEN : C_DIM, yes_hov);
+        draw_centered(win, yt, yes_b.left + yes_b.width/2.f, yes_b.top + 12.f);
+
+        // NO button
+        bool no_hov = no_b.contains(ms);
+        draw_box(win, no_b.left, no_b.top, no_b.width, no_b.height,
+                 no_hov ? sf::Color{60,10,10} : C_PANEL,
+                 no_hov ? C_RED : C_BORDER, no_hov ? 2.f : 1.5f);
+        auto nt2 = mkt(font, "NO   (N)", 18, no_hov ? C_RED : C_DIM, no_hov);
+        draw_centered(win, nt2, no_b.left + no_b.width/2.f, no_b.top + 12.f);
+
+        win.display();
+    }
+    return false;
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * show_action_window()
  * Called ONLY from the main thread.
@@ -210,7 +295,6 @@ static Action show_action_window(int pidx, const sf::Font& font)
                          std::string(me.name)+" - Choose Action",
                          sf::Style::Titlebar|sf::Style::Close);
     win.setFramerateLimit(60);
-    win.setVerticalSyncEnabled(false);
 
     sf::Clock clk;
 
@@ -254,7 +338,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
           if(vis[s]) continue;
           WeaponID w=me.inventory.slots[s]; if(w==WPN_NONE) continue;
           if(inv_first_slot_of(me.inventory,s)!=s) continue;
-          wbtns.push_back({{EB_X,wy,EB_W,EB_H},s,w}); wy+=EB_H+EB_G;
+          wbtns.push_back({{BTN_X,wy,BTN_W,BTN_H},s,w}); wy+=BTN_H+BTN_GAP;
           for(int k=s;k<INVENTORY_SLOTS&&me.inventory.slots[k]==w;k++) vis[k]=true; }}
 
     /* ── LTS buttons ── */
@@ -262,7 +346,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
     std::vector<LBtn> lbtns;
     { float ly=220.f;
       for(int i=0;i<me.lts.count;i++){
-          lbtns.push_back({{EB_X,ly,EB_W,EB_H},i,me.lts.weapons[i]}); ly+=EB_H+EB_G; }}
+          lbtns.push_back({{BTN_X,ly,BTN_W,BTN_H},i,me.lts.weapons[i]}); ly+=BTN_H+BTN_GAP; }}
 
     enum class St { ACTION, ENEMY, WEAPON, LTS };
     St state=St::ACTION;
@@ -270,17 +354,6 @@ static Action show_action_window(int pidx, const sf::Font& font)
     std::string status;
     Action result{};
 
-    auto draw_right_btn=[&](sf::RenderTarget& rt, sf::FloatRect b,
-                             bool hov, const std::string& main_txt,
-                             const std::string& sub_txt=""){
-        draw_box(rt,b.left,b.top,b.width,b.height,
-                 hov?C_SELECT:C_PANEL, hov?C_BORDER_HI:C_BORDER, hov?2.f:1.5f);
-        auto t=mkt(font,main_txt,13,hov?C_WHITE:C_DIM);
-        t.setPosition(b.left+8.f,b.top+4.f); rt.draw(t);
-        if(!sub_txt.empty()){
-            auto s=mkt(font,sub_txt,11,C_DIM);
-            s.setPosition(b.left+8.f,b.top+b.height-15.f); rt.draw(s); }
-    };
 
     while(win.isOpen()&&!g_quit){
         sf::Vector2f ms=win.mapPixelToCoords(sf::Mouse::getPosition(win));
@@ -397,7 +470,9 @@ static Action show_action_window(int pidx, const sf::Font& font)
          auto il=mkt(font,"INVENTORY",11,C_DIM); il.setPosition(ix,iy); win.draw(il); iy+=16.f;
          bool vis[INVENTORY_SLOTS]={},any=false;
          for(int s=0;s<INVENTORY_SLOTS;s++){
-             if(vis[s]) continue; WeaponID w=me.inventory.slots[s]; if(w==WPN_NONE) continue;
+             if(vis[s]) continue;
+             WeaponID w=me.inventory.slots[s];
+             if(w==WPN_NONE) continue;
              if(inv_first_slot_of(me.inventory,s)!=s) continue;
              std::ostringstream ws; ws<<"["<<s<<"] "<<weapon_def(w).name<<" (dmg "<<weapon_def(w).damage<<")";
              auto wt=mkt(font,ws.str(),12,C_ACCENT); wt.setPosition(ix,iy); win.draw(wt); iy+=16.f; any=true;
@@ -431,11 +506,32 @@ static Action show_action_window(int pidx, const sf::Font& font)
             }
         } else if(state==St::WEAPON){
             for(auto& wb:wbtns){
-                std::ostringstream ws; ws<<"["<<wb.slot<<"]  "<<weapon_def(wb.wid).name<<"   dmg "<<weapon_def(wb.wid).damage;
-                draw_right_btn(win,wb.b,wb.hov,ws.str()); }
+                sf::Color fill=wb.hov?sf::Color{15,25,55}:C_PANEL;
+                sf::Color bord=wb.hov?C_BORDER_HI:C_BORDER;
+                draw_box(win,wb.b.left,wb.b.top,wb.b.width,wb.b.height,fill,bord,wb.hov?2.f:1.5f);
+                if(wb.hov){sf::RectangleShape bar({3.f,wb.b.height-8.f});
+                    bar.setPosition(wb.b.left+4.f,wb.b.top+4.f);
+                    bar.setFillColor(C_ACCENT); win.draw(bar);}
+                std::ostringstream ws;
+                ws<<weapon_def(wb.wid).name<<"  dmg "<<weapon_def(wb.wid).damage
+                  <<"  ["<<weapon_def(wb.wid).slots<<" slots]";
+                auto lt=mkt(font,ws.str(),15,wb.hov?C_WHITE:sf::Color{160,170,190},wb.hov);
+                lt.setPosition(wb.b.left+14.f,wb.b.top+7.f); win.draw(lt);
+                std::ostringstream ss2; ss2<<"slot "<<wb.slot;
+                auto st=mkt(font,ss2.str(),11,wb.hov?C_ACCENT:C_DIM);
+                st.setPosition(wb.b.left+14.f,wb.b.top+wb.b.height-18.f); win.draw(st);
+            }
             auto bk=mkt(font,"ESC to go back",11,C_DIM); bk.setPosition(34.f,by+10.f); win.draw(bk);
         } else if(state==St::LTS){
-            for(auto& lb:lbtns){ draw_right_btn(win,lb.b,lb.hov,weapon_def(lb.wid).name); }
+            for(auto& lb:lbtns){
+                sf::Color fill=lb.hov?sf::Color{15,25,55}:C_PANEL;
+                sf::Color bord=lb.hov?C_BORDER_HI:C_BORDER;
+                draw_box(win,lb.b.left,lb.b.top,lb.b.width,lb.b.height,fill,bord,lb.hov?2.f:1.5f);
+                std::ostringstream ls;
+                ls<<weapon_def(lb.wid).name<<"  dmg "<<weapon_def(lb.wid).damage;
+                auto lt=mkt(font,ls.str(),15,lb.hov?C_WHITE:sf::Color{160,170,190},lb.hov);
+                lt.setPosition(lb.b.left+14.f,lb.b.top+7.f); win.draw(lt);
+            }
             auto bk=mkt(font,"ESC to go back",11,C_DIM); bk.setPosition(34.f,by+10.f); win.draw(bk);
         } else {
             auto wt=mkt(font,"Click an enemy on the right",13,C_DIM); wt.setPosition(34.f,240.f); win.draw(wt);
@@ -537,7 +633,7 @@ static void* player_thread(void* arg_)
 static void* dispatcher(void*)
 {
     while(!g_quit){
-        sem_wait(&gs->turn_sem);
+        sem_wait(&gs->hip_turn_sem);
         if(g_quit) break;
         int ct=gs->current_turn;
         if(ct>=0&&ct<gs->num_players&&gs->entities[ct].alive)
@@ -581,6 +677,20 @@ int main(int argc, char* argv[])
 
     /* ── Main thread: serve UI requests until game over ── */
     while(!g_quit&&gs->phase!=GamePhase::GAME_OVER){
+
+        /* Check for pending weapon drop (arbiter waiting for player response) */
+        if(gs->pending_drop_ready && !gs->pending_drop_done) {
+            int pidx = gs->pending_drop_for;
+            WeaponID wpn = gs->pending_drop_wpn;
+            bool taken = false;
+            if(pidx >= 0 && pidx < g_num_players)
+                taken = show_drop_window(wpn, pidx, font);
+            sem_wait(&gs->state_mutex);
+            gs->pending_drop_taken = taken;
+            gs->pending_drop_done  = true;
+            sem_post(&gs->state_mutex);
+        }
+
         /* Non-blocking check for UI request (timeout 100ms) */
         struct timespec ts{}; clock_gettime(CLOCK_REALTIME,&ts);
         ts.tv_nsec+=100000000LL; if(ts.tv_nsec>=1000000000LL){ts.tv_sec++;ts.tv_nsec-=1000000000LL;}
@@ -606,7 +716,7 @@ int main(int argc, char* argv[])
     g_quit=1;
     /* Unblock anything waiting */
     for(int i=0;i<g_num_players;i++) sem_post(&player_sem[i]);
-    sem_post(&gs->turn_sem);
+    sem_post(&gs->hip_turn_sem);
     sem_post(&g_ui_request_sem);
     sem_post(&g_ui_done_sem);
 

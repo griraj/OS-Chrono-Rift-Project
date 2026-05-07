@@ -170,7 +170,8 @@ struct SharedState {
     /* ── Synchronisation (memory-based, no pipes) ── */
     sem_t state_mutex;      /* protects full state  (pshared=1, init=1) */
     sem_t action_sem;       /* arbiter waits; entity posts when ready    */
-    sem_t turn_sem;         /* entity waits; arbiter posts on its turn   */
+    sem_t hip_turn_sem;     /* hip dispatcher waits; arbiter posts on PLAYER turn */
+    sem_t asp_turn_sem;     /* asp dispatcher waits; arbiter posts on ENEMY turn  */
     sem_t artifact_mutex;   /* protects artifact table                   */
     sem_t log_mutex;        /* protects log ring buffer                  */
 
@@ -178,6 +179,14 @@ struct SharedState {
     pid_t arbiter_pid   = 0;
     pid_t hip_pid       = 0;
     pid_t asp_pid       = 0;
+
+    /* Weapon drop: arbiter sets after enemy death,
+     * hip shows pickup prompt, then clears it */
+    WeaponID pending_drop_wpn   = WPN_NONE;
+    int      pending_drop_for   = -1;    // player entity idx offered the drop
+    bool     pending_drop_ready = false; // arbiter→hip: drop is waiting
+    bool     pending_drop_done  = false; // hip→arbiter: player responded
+    bool     pending_drop_taken = false; // hip→arbiter: player picked it up
 
     /* Roll number seed */
     unsigned seed = 0;

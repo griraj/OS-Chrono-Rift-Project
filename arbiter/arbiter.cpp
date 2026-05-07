@@ -1,3 +1,25 @@
+/*
+ * arbiter.cpp  –  Game Arbiter Process (produces 'arbiter_bin')
+ *
+ * Responsibilities:
+ *  - Creates and owns the POSIX shared memory segment
+ *  - Initialises all entities with roll-number-seeded stats
+ *  - Runs the stamina-based scheduler (1 s ticks)
+ *  - Enforces serial action execution
+ *  - Applies all actions and updates game state
+ *  - Spawns hip and asp child processes
+ *  - Spawns the SFML rendering thread (replaces ncurses)
+ *  - Delivers SIGUSR1 (stun) to target process
+ *  - Sends SIGSTOP/SIGCONT to asp for Ultimate pause (10 s via SIGALRM)
+ *  - Handles SIGTERM (quit from hip)
+ *  - Runs background deadlock-monitor thread
+ *  - Manages process lifecycle (wait/reap children on game over)
+ *
+ * SFML NOTE:
+ *  SFML windows MUST be created and used exclusively from the thread that
+ *  owns them. The rendering thread therefore creates the sf::RenderWindow
+ *  itself. The main/game threads never touch it.
+ */
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +68,9 @@ static void sig_alrm(int)
 {
     g_ultimate = 0;
     if (g_asp_pid > 0) kill(g_asp_pid, SIGCONT);
-    sem_post(&gs->turn_sem);
+    // After Ultimate ends, next turn could be anyone — wake both dispatchers
+    sem_post(&gs->hip_turn_sem);
+    sem_post(&gs->asp_turn_sem);
 }
 
 /* ── Shared-memory helpers ────────────────────────────────────────── */
@@ -84,6 +108,8 @@ static void init_player(Entity& e, int idx, int num_players,
     e.max_stamina = 100;
     e.stamina     = 0.0f;
     e.alive       = true;
+    // Every player starts with a Splinter Stick so Use Weapon is available
+    inv_pickup(e, WPN_SPLINTER_STICK);
 }
 
 static void init_enemy(Entity& e, int idx, unsigned roll_no,
@@ -100,6 +126,15 @@ static void init_enemy(Entity& e, int idx, unsigned roll_no,
     e.max_stamina = 150;
     e.stamina     = 0.0f;
     e.alive       = true;
+    // 50% chance enemy carries a non-artifact weapon (won't drop on death per spec)
+    static const WeaponID ENEMY_WPNS[] = {
+        WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_FROSTBOW,
+        WPN_OBSIDIAN_AXE,   WPN_THUNDERSTAFF
+    };
+    if (rng_range(seed, 0, 1) == 1) {
+        int wi = rng_range(seed, 0, 4);
+        inv_pickup(e, ENEMY_WPNS[wi]);
+    }
 }
 
 /* ── Shared state initialisation ──────────────────────────────────── */
@@ -110,7 +145,8 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
     /* pshared=1 → semaphores shared across processes */
     sem_init(&gs->state_mutex,    1, 1);
     sem_init(&gs->action_sem,     1, 0);
-    sem_init(&gs->turn_sem,       1, 0);
+    sem_init(&gs->hip_turn_sem,   1, 0);
+    sem_init(&gs->asp_turn_sem,   1, 0);
     sem_init(&gs->artifact_mutex, 1, 1);
     sem_init(&gs->log_mutex,      1, 1);
 
@@ -374,7 +410,11 @@ static void arbiter_main_loop()
         actor.action_done      = false;
         sem_post(&gs->state_mutex);
 
-        sem_post(&gs->turn_sem);
+        // Post to the correct process only
+        if (actor.type == EntityType::PLAYER)
+            sem_post(&gs->hip_turn_sem);
+        else
+            sem_post(&gs->asp_turn_sem);
 
         if (actor.type == EntityType::PLAYER) {
             sem_wait(&gs->action_sem);
@@ -418,6 +458,73 @@ static void arbiter_main_loop()
                 snprintf(buf, sizeof(buf), "%s has been defeated!", en.name);
                 game_log(buf);
                 en.stamina = -1.0f;
+
+                // Weapon drop: find a non-artifact weapon the enemy held
+                // (spec: enemy-carried weapons are NOT dropped — only world drops)
+                // We generate a fresh random drop instead (50% chance)
+                static const WeaponID DROP_TABLE[] = {
+                    WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_IRON_HALBERD,
+                    WPN_FROSTBOW, WPN_OBSIDIAN_AXE, WPN_THUNDERSTAFF
+                };
+                if (rng_range(g_seed, 0, 1) == 1 &&
+                    gs->pending_drop_ready == false) {
+                    // Offer drop to the player who dealt the killing blow
+                    // (use actor_idx captured from outer scope)
+                    int offer_to = ready; // entity that just acted
+                    if (gs->entities[offer_to].type != EntityType::PLAYER) {
+                        // find first alive player
+                        offer_to = 0;
+                        for (int p = 0; p < gs->num_players; ++p)
+                            if (gs->entities[p].alive) { offer_to = p; break; }
+                    }
+                    WeaponID drop = DROP_TABLE[rng_range(g_seed, 0, 5)];
+                    sem_wait(&gs->state_mutex);
+                    gs->pending_drop_wpn   = drop;
+                    gs->pending_drop_for   = offer_to;
+                    gs->pending_drop_ready = true;
+                    gs->pending_drop_done  = false;
+                    gs->pending_drop_taken = false;
+                    sem_post(&gs->state_mutex);
+
+                    snprintf(buf, sizeof(buf),
+                             "%s dropped a %s! Pick it up?",
+                             en.name, weapon_def(drop).name);
+                    game_log(buf);
+
+                    // Wait for hip to respond (with timeout)
+                    struct timespec dl{};
+                    clock_gettime(CLOCK_REALTIME, &dl);
+                    dl.tv_sec += 30; // 30 s to decide
+                    while (!gs->pending_drop_done) {
+                        struct timespec ns{0, 20000000};
+                        nanosleep(&ns, nullptr);
+                        struct timespec now{};
+                        clock_gettime(CLOCK_REALTIME, &now);
+                        if (now.tv_sec >= dl.tv_sec) break;
+                    }
+
+                    if (gs->pending_drop_taken) {
+                        inv_pickup(gs->entities[offer_to], drop);
+                        snprintf(buf, sizeof(buf), "%s picked up %s!",
+                                 gs->entities[offer_to].name, weapon_def(drop).name);
+                    } else {
+                        // Spec: if player doesn't pick up, an enemy is guaranteed to
+                        // Find a living enemy and give it the weapon
+                        for (int e2 = gs->num_players; e2 < gs->total_entities; ++e2) {
+                            if (gs->entities[e2].alive) {
+                                inv_pickup(gs->entities[e2], drop);
+                                snprintf(buf, sizeof(buf), "Enemy picked up %s!",
+                                         weapon_def(drop).name);
+                                break;
+                            }
+                        }
+                    }
+                    game_log(buf);
+
+                    sem_wait(&gs->state_mutex);
+                    gs->pending_drop_ready = false;
+                    sem_post(&gs->state_mutex);
+                }
             }
         }
 
@@ -892,7 +999,8 @@ int arbiter_main(int argc, char* argv[])
 
     sem_destroy(&gs->state_mutex);
     sem_destroy(&gs->action_sem);
-    sem_destroy(&gs->turn_sem);
+    sem_destroy(&gs->hip_turn_sem);
+    sem_destroy(&gs->asp_turn_sem);
     sem_destroy(&gs->artifact_mutex);
     sem_destroy(&gs->log_mutex);
 

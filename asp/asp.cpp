@@ -4,7 +4,7 @@
  * Responsibilities:
  *  - Opens the POSIX shared memory segment (no creation)
  *  - Creates ONE pthread per enemy NPC  (concurrent, not sequential)
- *  - Creates ONE dispatcher thread watching gs->turn_sem
+ *  - Creates ONE dispatcher thread watching gs->asp_turn_sem
  *  - Each NPC thread independently decides its action (true concurrency)
  *  - NPC AI posts action to shared memory mailbox, signals arbiter via action_sem
  *  - Handles SIGUSR1 (stun): affected NPC skips its turn
@@ -174,7 +174,7 @@ static void* npc_thread(void* arg_)
 static void* dispatcher(void*)
 {
     while (!g_quit) {
-        sem_wait(&gs->turn_sem);
+        sem_wait(&gs->asp_turn_sem);
         if (g_quit) break;
 
         int ct    = gs->current_turn;
@@ -219,7 +219,7 @@ int main(int argc, char* argv[])
 
     g_quit = 1;
     for (int i = 0; i < g_num_enemies; ++i) sem_post(&npc_sem[i]);
-    sem_post(&gs->turn_sem);
+    sem_post(&gs->asp_turn_sem);
 
     pthread_join(disp_tid, nullptr);
     for (int i = 0; i < g_num_enemies; ++i)
