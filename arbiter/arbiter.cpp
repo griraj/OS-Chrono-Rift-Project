@@ -1005,7 +1005,7 @@ static void *render_thread_fn(void *)
         "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
         nullptr};
     bool font_loaded = false;
-    
+
     for (int i = 0; font_paths[i]; ++i)
     {
         if (font.loadFromFile(font_paths[i]))
@@ -1031,6 +1031,8 @@ static void *render_thread_fn(void *)
                splash_clk.getElapsedTime().asSeconds() < SPLASH_SECS)
         {
             sf::Event ev{};
+
+            
             while (window.pollEvent(ev))
             {
                 if (ev.type == sf::Event::Closed)
@@ -1075,7 +1077,7 @@ static void *render_thread_fn(void *)
             window.draw(rl1);
 
             sf::Text title("CHRONO  RIFT", font, 72);
-            title.setFillColor({220, 185, 80, a});
+            title.setFillColor({220, 195, 80, a});
             title.setStyle(sf::Text::Bold);
             sf::FloatRect tb = title.getLocalBounds();
             title.setOrigin(tb.left + tb.width / 2.f, tb.top + tb.height / 2.f);
@@ -1087,7 +1089,7 @@ static void *render_thread_fn(void *)
             rl2.setFillColor({220, 185, 80, a});
             window.draw(rl2);
 
-            sf::Text sub("CS 2006  â  Operating Systems  â  Spring 2026",
+            sf::Text sub("",
                          font, 16);
             sub.setFillColor({180, 190, 210, sa});
             sf::FloatRect sb = sub.getLocalBounds();
@@ -1144,7 +1146,7 @@ static void *render_thread_fn(void *)
                                                                                                           : C_HP_PLAYER;
 
             std::ostringstream title;
-            title << "CHRONO RIFT      Kills: "
+            title << "CHRONO RIFT      Kills : "
                   << snap.enemies_killed << " / " << MAX_ENEMIES_KILL
                   << phase_str;
 
@@ -1166,7 +1168,7 @@ static void *render_thread_fn(void *)
         draw_section_line(window, cx + 8.f, cy + 6.f, left_w - 16.f, "PLAYERS", font);
 
         {
-            sf::Text hdr("Name           Status  HP Bar                             HP         Stamina Bar      ST", font, 11);
+            sf::Text hdr("      Name                    Status  HP Bar        HP        Stamina Bar      ST", font, 11);
             hdr.setFillColor(C_SECTION);
             hdr.setPosition(cx + 6.f, cy + 18.f);
             window.draw(hdr);
@@ -1244,6 +1246,7 @@ static void *render_thread_fn(void *)
 
             sf::Color lc = C_LOG_TEXT;
             std::string line_str = snap.log[idx];
+
             if (line_str.find("ULTIMATE") != std::string::npos)
                 lc = C_ULTIMATE;
             else if (line_str.find("STUN") != std::string::npos)
@@ -1310,7 +1313,7 @@ int arbiter_main(int argc, char *argv[])
 {
     if (argc < 3)
     {
-        fprintf(stderr, "Usage: arbiter <roll_number> <num_players>\n");
+        fprintf(stderr, "Usage : arbiter <roll_number> <num_players>\n");
         return 1;
     }
 
