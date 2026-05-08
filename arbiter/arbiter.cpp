@@ -495,18 +495,23 @@ static void arbiter_main_loop()
         sem_post(&gs->state_mutex);
 
         bool ultimate_triggered = (act.type == ActionType::ULTIMATE);
-        bool stun_triggered = false;
+        bool stun_candidate = false;
+        int  stun_target    = -1;
         if ((act.type == ActionType::STRIKE || act.type == ActionType::USE_WEAPON)
             && act.target_idx >= 0 && gs->entities[act.target_idx].alive) {
             unsigned tmp = g_seed;
-            stun_triggered = (rng_range(tmp, 1, 5) == 1);
+            stun_candidate = (rng_range(tmp, 1, 5) == 1);
             g_seed = tmp;
+            stun_target = act.target_idx;
         }
 
         apply_action(ready, act);
 
         if (ultimate_triggered) trigger_ultimate(ready);
-        if (stun_triggered)     deliver_stun(act.target_idx);
+
+        /* Only stun if target survived the hit */
+        if (stun_candidate && stun_target >= 0 && gs->entities[stun_target].alive)
+            deliver_stun(stun_target);
 
         for (int i = gs->num_players; i < gs->total_entities; ++i)
         {

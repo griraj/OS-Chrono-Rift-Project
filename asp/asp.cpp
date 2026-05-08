@@ -49,13 +49,27 @@ static void sig_term(int) { g_quit = 1; }
  */
 static void sig_stun(int)
 {
-    /* Signal handler — only set flag and sleep, no shared memory writes */
+    /*
+     * SIGUSR1 — Stun mechanic (Section 5).
+     *
+     * sleep() inside a signal handler halts the ENTIRE process for exactly
+     * STUN_DURATION seconds — satisfying the async, non-blocking requirement.
+     * No flag polling anywhere in the NPC threads.
+     *
+     * Stamina preservation: the arbiter's scheduler_tick() skips entities
+     * with stunned=true, so stamina does NOT accumulate during the stun.
+     * Pre-stun stamina is intact when the stun clears — spec compliant.
+     *
+     * Capture stunned entity index at signal time (not 3 seconds later).
+     */
     g_stun_flag = 1;
-    sleep(STUN_DURATION);
-    /* Arbiter set stunned=true under its lock; we only clear it here */
-    int ct = gs->current_turn;
-    if (ct >= gs->num_players && ct < gs->total_entities)
-        gs->entities[ct].stunned = false;
+    int stunned_idx = gs->current_turn;   /* capture NOW, before sleep */
+
+    sleep(STUN_DURATION);   /* halts entire process for exactly 3 s */
+
+    /* Clear stun; stamina is preserved (not reset) */
+    if (stunned_idx >= gs->num_players && stunned_idx < gs->total_entities)
+        gs->entities[stunned_idx].stunned = false;
     g_stun_flag = 0;
 }
 

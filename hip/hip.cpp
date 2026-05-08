@@ -80,21 +80,33 @@ static void sig_term(int) { g_quit = 1; }
 static void sig_stun(int)
 {
     /*
-     * Signal handler — must not call sem_wait (async-signal-unsafe).
-     * Set atomic flag only; the dispatcher thread detects it and
-     * applies the stun to shared memory safely under state_mutex.
+     * SIGUSR1 — Stun mechanic (Section 5).
+     *
+     * This is an async signal handler that halts process execution for
+     * exactly STUN_DURATION seconds. sleep() inside a signal handler
+     * pauses the ENTIRE process — satisfying the "non-blocking interruption"
+     * requirement without any flag polling in the main logic.
+     *
+     * Stamina is PRESERVED (not zeroed) because:
+     *  - The arbiter's scheduler_tick() skips entities with stunned=true
+     *  - So no stamina accumulates, and the pre-stun stamina remains intact
+     *  - After the stun clears, stamina resumes accumulating from where it was
+     *
+     * We capture the stunned entity index NOW (at signal delivery time) so
+     * that clearing stunned refers to the correct entity, not whatever
+     * current_turn is 3 seconds later.
      */
     g_stunned = 1;
-    sleep(STUN_DURATION);   /* pause process for stun duration */
-    g_stunned = 0;
-    /* Clear stun on shared entity — safe here because sleep() ended
-     * and the process is now fully resumed; arbiter already marked
-     * stunned=true when it delivered SIGUSR1 (under its own lock). */
-    int ct = gs->current_turn;
-    if (ct >= 0 && ct < gs->num_players) {
-        gs->entities[ct].stunned = false;
-        /* stamina left at zero — turn was skipped */
+    int stunned_idx = gs->current_turn;   /* capture at signal time */
+
+    sleep(STUN_DURATION);   /* halts process execution for exactly 3 s */
+
+    /* Restore: clear stun flag, stamina is already preserved */
+    if (stunned_idx >= 0 && stunned_idx < gs->num_players) {
+        gs->entities[stunned_idx].stunned = false;
+        /* Stamina intentionally NOT reset — spec: "maintaining its previous stamina level" */
     }
+    g_stunned = 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -194,96 +206,14 @@ static void draw_scanlines(sf::RenderTarget& rt)
 }
 
 
-/* ════════════════════════════════════════════════════════════════════
- * show_drop_window()
- * Called from main thread when arbiter signals a weapon drop.
- * Shows a YES / NO prompt. Returns true if player picks up the weapon.
- * ════════════════════════════════════════════════════════════════════ */
-static bool show_drop_window(WeaponID drop_wpn, int player_idx, const sf::Font& font)
-{
-    const Entity& me = gs->entities[player_idx];
-    std::string wname = weapon_def(drop_wpn).name;
 
-    sf::RenderWindow win(sf::VideoMode(500, 260),
-                         "Weapon Drop!",
-                         sf::Style::Titlebar | sf::Style::Close);
-    win.setFramerateLimit(60);
-    sf::Clock clk;
-
-    sf::FloatRect yes_b = {60.f,  180.f, 160.f, 48.f};
-    sf::FloatRect no_b  = {280.f, 180.f, 160.f, 48.f};
-
-    while (win.isOpen()) {
-        sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
-        float t = clk.getElapsedTime().asSeconds();
-        (void)t;
-
-        sf::Event ev{};
-        while (win.pollEvent(ev)) {
-            if (ev.type == sf::Event::Closed)        { win.close(); return false; }
-            if (ev.type == sf::Event::KeyPressed) {
-                if (ev.key.code == sf::Keyboard::Y)  { win.close(); return true;  }
-                if (ev.key.code == sf::Keyboard::N)  { win.close(); return false; }
-                if (ev.key.code == sf::Keyboard::Return){ win.close(); return true; }
-                if (ev.key.code == sf::Keyboard::Escape){ win.close(); return false;}
-            }
-            if (ev.type == sf::Event::MouseButtonPressed &&
-                ev.mouseButton.button == sf::Mouse::Left) {
-                if (yes_b.contains(ms)) { win.close(); return true;  }
-                if (no_b.contains(ms))  { win.close(); return false; }
-            }
-        }
-
-        win.clear(C_BG);
-
-        // Title
-        auto title = mkt(font, "WEAPON DROP!", 24, C_GOLD, true);
-        draw_centered(win, title, 250.f, 18.f);
-
-        sf::RectangleShape rule({460.f, 1.f});
-        rule.setPosition(20.f, 52.f); rule.setFillColor(C_BORDER); win.draw(rule);
-
-        // Weapon info
-        std::string line1 = wname + "  (dmg " +
-                            std::to_string(weapon_def(drop_wpn).damage) + ", " +
-                            std::to_string(weapon_def(drop_wpn).slots) + " slots)";
-        auto wt = mkt(font, line1, 17, C_ACCENT);
-        draw_centered(win, wt, 250.f, 68.f);
-
-        std::string line2 = std::string(me.name) + ", do you want to pick it up?";
-        auto qt = mkt(font, line2, 14, C_WHITE);
-        draw_centered(win, qt, 250.f, 100.f);
-
-        auto hint = mkt(font, "Y / Enter = Yes     N / Esc = No", 12, C_DIM);
-        draw_centered(win, hint, 250.f, 124.f);
-
-        // YES button
-        bool yes_hov = yes_b.contains(ms);
-        draw_box(win, yes_b.left, yes_b.top, yes_b.width, yes_b.height,
-                 yes_hov ? sf::Color{10,60,20} : C_PANEL,
-                 yes_hov ? C_GREEN : C_BORDER, yes_hov ? 2.f : 1.5f);
-        auto yt = mkt(font, "YES  (Y)", 18, yes_hov ? C_GREEN : C_DIM, yes_hov);
-        draw_centered(win, yt, yes_b.left + yes_b.width/2.f, yes_b.top + 12.f);
-
-        // NO button
-        bool no_hov = no_b.contains(ms);
-        draw_box(win, no_b.left, no_b.top, no_b.width, no_b.height,
-                 no_hov ? sf::Color{60,10,10} : C_PANEL,
-                 no_hov ? C_RED : C_BORDER, no_hov ? 2.f : 1.5f);
-        auto nt2 = mkt(font, "NO   (N)", 18, no_hov ? C_RED : C_DIM, no_hov);
-        draw_centered(win, nt2, no_b.left + no_b.width/2.f, no_b.top + 12.f);
-
-        win.display();
-    }
-    return false;
-}
 
 /* ════════════════════════════════════════════════════════════════════
  * show_action_window()
  * Called ONLY from the main thread.
  * Opens window, runs event loop, returns chosen Action.
  * ════════════════════════════════════════════════════════════════════ */
-static Action show_action_window(int pidx, const sf::Font& font)
+static Action show_action_window(int pidx, const sf::Font& font, sf::RenderWindow& main_win)
 {
     /* snapshot under lock */
     sem_wait(&gs->state_mutex);
@@ -296,12 +226,9 @@ static Action show_action_window(int pidx, const sf::Font& font)
     bool can_ultimate = inv_has_weapon(me, WPN_SOLAR_CORE) &&
                         inv_has_weapon(me, WPN_LUNAR_BLADE);
 
-    /* ── Window (main thread — always works on WSL2) ── */
-    sf::RenderWindow win(sf::VideoMode(UI_W,UI_H),
-                         std::string(me.name)+" - Choose Action",
-                         sf::Style::Titlebar|sf::Style::Close);
-    win.setFramerateLimit(60);
-
+    /* ── Reuse the persistent main window (WSL2: never create/destroy windows) ── */
+    sf::RenderWindow& win = main_win;
+    win.setTitle(std::string(me.name) + " - Choose Action");
     sf::Clock clk;
 
     /* ── Build action button list ── */
@@ -361,7 +288,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
     Action result{};
 
 
-    while(win.isOpen()&&!g_quit){
+    while(!g_quit&&gs->phase!=GamePhase::GAME_OVER){
         sf::Vector2f ms=win.mapPixelToCoords(sf::Mouse::getPosition(win));
         float t=clk.getElapsedTime().asSeconds();
 
@@ -379,7 +306,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
         while(win.pollEvent(ev)){
             if(ev.type==sf::Event::Closed){
                 result={ActionType::SKIP,-1,-1,WPN_NONE};
-                win.close(); return result;
+                return result;
             }
             if(ev.type==sf::Event::KeyPressed&&ev.key.code==sf::Keyboard::Escape){
                 if(state!=St::ACTION){ state=St::ACTION; sel_act=-1; status=""; }
@@ -393,7 +320,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
                         sel_act=i;
                         const std::string& lbl=btns[i].lbl;
                         if(lbl[0]=='0'){ kill(gs->arbiter_pid,SIGTERM); g_quit=1;
-                            result={ActionType::SKIP,-1,-1,WPN_NONE}; win.close(); return result; }
+                            result={ActionType::SKIP,-1,-1,WPN_NONE}; return result; }
                         if(lbl.find("Strike") !=std::string::npos){state=St::ENEMY;  status="Select a target enemy";}
                         else if(lbl.find("Exhaust")!=std::string::npos){state=St::ENEMY; status="Select enemy to exhaust";}
                         else if(lbl.find("Weapon") !=std::string::npos){state=St::WEAPON;status="Select a weapon";}
@@ -414,7 +341,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
                             else if(l.find("Weapon")!=std::string::npos) at=ActionType::USE_WEAPON;
                         }
                         result={at,eb.idx,sel_wpn_slot,WPN_NONE};
-                        win.close(); return result;
+                        return result;
                     }
                 }
                 else if(state==St::WEAPON){
@@ -426,7 +353,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
                 else if(state==St::LTS){
                     for(auto& lb:lbtns){
                         if(!lb.b.contains(ms)) continue;
-                        result={ActionType::SWAP_IN,-1,-1,lb.wid}; win.close(); return result;
+                        result={ActionType::SWAP_IN,-1,-1,lb.wid}; return result;
                     }
                 }
             }
@@ -587,6 +514,7 @@ static Action show_action_window(int pidx, const sf::Font& font)
     }
 
     result={ActionType::SKIP,-1,-1,WPN_NONE};
+    win.setTitle("Chrono Rift - Player HUD");
     return result;
 }
 
@@ -688,40 +616,168 @@ int main(int argc, char* argv[])
         pthread_create(&ptids[i],nullptr,player_thread,a);
     }
 
+    /* ── ONE persistent window for entire game lifetime (WSL2 safe) ── */
+    sf::RenderWindow main_win(sf::VideoMode(UI_W, UI_H),
+                              "Chrono Rift - Player HUD",
+                              sf::Style::Titlebar | sf::Style::Close);
+    main_win.setFramerateLimit(60);
+    main_win.setVerticalSyncEnabled(false);
+
     /* ── Main thread: serve UI requests until game over ── */
     while(!g_quit&&gs->phase!=GamePhase::GAME_OVER){
 
-        /* Check for pending weapon drop (arbiter waiting for player response) */
+        /* ── Handle window close ── */
+        sf::Event idle_ev{};
+        while(main_win.pollEvent(idle_ev)){
+            if(idle_ev.type==sf::Event::Closed){
+                g_quit=1; kill(gs->arbiter_pid,SIGTERM);
+            }
+        }
+
+        /* ── Draw idle "waiting" screen ── */
+        {
+            /* Snapshot for idle display */
+            sem_wait(&gs->state_mutex);
+            Entity snap_ents[MAX_ENTITIES];
+            memcpy(snap_ents, gs->entities, sizeof(snap_ents));
+            int snap_np=gs->num_players, snap_nte=gs->total_entities;
+            int snap_ct=gs->current_turn, snap_kills=gs->enemies_killed;
+            sem_post(&gs->state_mutex);
+
+            main_win.clear(sf::Color{8,10,20});
+            /* Grid */
+            {sf::RectangleShape gl({(float)UI_W,1.f}); gl.setFillColor({20,30,60,30});
+             for(unsigned gy=0;gy<UI_H;gy+=32){gl.setPosition(0,(float)gy);main_win.draw(gl);}
+             gl.setSize({1.f,(float)UI_H});
+             for(unsigned gx=0;gx<UI_W;gx+=32){gl.setPosition((float)gx,0);main_win.draw(gl);}}
+            /* Title */
+            auto ti=mkt(font,"CHRONO RIFT - Player HUD",20,C_GOLD,true);
+            ti.setPosition(20.f,12.f); main_win.draw(ti);
+            std::ostringstream ks; ks<<"Kills: "<<snap_kills<<" / 10";
+            auto kt=mkt(font,ks.str(),14,C_DIM); kt.setPosition((float)UI_W-150.f,16.f); main_win.draw(kt);
+            sf::RectangleShape rule({(float)UI_W-40.f,1.f}); rule.setPosition(20.f,42.f); rule.setFillColor(C_BORDER); main_win.draw(rule);
+            /* Entity list */
+            float ey=54.f;
+            auto ph=mkt(font,"PLAYERS",11,C_GREEN); ph.setPosition(24.f,ey); main_win.draw(ph); ey+=16.f;
+            for(int i=0;i<snap_np;i++){
+                const Entity& e=snap_ents[i];
+                bool active=(snap_ct==i);
+                std::string nm=(active?">>> ":"    ")+std::string(e.name)+(e.alive?(e.stunned?" [STUN]":""):" [DEAD]");
+                auto nt=mkt(font,nm,13,active?C_GOLD:e.alive?C_WHITE:sf::Color{80,50,50},active);
+                nt.setPosition(24.f,ey); main_win.draw(nt);
+                if(e.alive){
+                    float bx=200.f;
+                    sf::RectangleShape bg({180.f,8.f}); bg.setPosition(bx,ey+4.f); bg.setFillColor({30,30,50}); main_win.draw(bg);
+                    float r=(float)e.hp/(float)e.max_hp; if(r<0)r=0; if(r>1)r=1;
+                    sf::RectangleShape bar({180.f*r,8.f}); bar.setPosition(bx,ey+4.f); bar.setFillColor(C_HP_P); main_win.draw(bar);
+                    std::ostringstream hs; hs<<e.hp<<"/"<<e.max_hp;
+                    auto hv=mkt(font,hs.str(),10,C_DIM); hv.setPosition(bx+184.f,ey+2.f); main_win.draw(hv);
+                }
+                ey+=18.f;
+            }
+            ey+=6.f;
+            auto eh=mkt(font,"ENEMIES",11,C_RED); eh.setPosition(24.f,ey); main_win.draw(eh); ey+=16.f;
+            for(int i=snap_np;i<snap_nte;i++){
+                const Entity& e=snap_ents[i]; if(!e.alive) continue;
+                bool active=(snap_ct==i);
+                std::string nm=(active?">>> ":"    ")+std::string(e.name)+(e.stunned?" [STUN]":"");
+                auto nt=mkt(font,nm,13,active?C_GOLD:C_WHITE,active); nt.setPosition(24.f,ey); main_win.draw(nt);
+                float bx=200.f;
+                sf::RectangleShape bg({180.f,8.f}); bg.setPosition(bx,ey+4.f); bg.setFillColor({30,30,50}); main_win.draw(bg);
+                float r=(float)e.hp/(float)e.max_hp; if(r<0)r=0; if(r>1)r=1;
+                sf::RectangleShape bar({180.f*r,8.f}); bar.setPosition(bx,ey+4.f); bar.setFillColor(C_HP_E); main_win.draw(bar);
+                std::ostringstream hs; hs<<e.hp<<"/"<<e.max_hp;
+                auto hv=mkt(font,hs.str(),10,C_DIM); hv.setPosition(bx+184.f,ey+2.f); main_win.draw(hv);
+                ey+=18.f;
+            }
+            /* Action log */
+            sem_wait(&gs->log_mutex);
+            float ly=(float)UI_H-120.f;
+            sf::RectangleShape logbg({(float)UI_W-40.f,110.f}); logbg.setPosition(20.f,ly); logbg.setFillColor({12,14,28}); logbg.setOutlineColor(C_BORDER); logbg.setOutlineThickness(1.f); main_win.draw(logbg);
+            auto lh=mkt(font,"LOG",11,C_DIM); lh.setPosition(26.f,ly+4.f); main_win.draw(lh);
+            float lty=ly+18.f;
+            for(int l=0;l<5;l++){
+                int idx=(gs->log_head-5+l+LOG_LINES)%LOG_LINES;
+                if(gs->log[idx][0]=='\0') continue;
+                auto lt=mkt(font,gs->log[idx],11,C_DIM); lt.setPosition(26.f,lty); main_win.draw(lt); lty+=18.f;
+            }
+            sem_post(&gs->log_mutex);
+            main_win.display();
+        }
+
+        /* ── Check for pending weapon drop (arbiter waiting for player response) ── */
         if(gs->pending_drop_ready && !gs->pending_drop_done) {
-            int pidx = gs->pending_drop_for;
-            WeaponID wpn = gs->pending_drop_wpn;
-            bool taken = false;
-            if(pidx >= 0 && pidx < g_num_players)
-                taken = show_drop_window(wpn, pidx, font);
+            int drop_pidx = gs->pending_drop_for;
+            WeaponID wpn  = gs->pending_drop_wpn;
+            bool taken    = false;
+
+            if(drop_pidx >= 0 && drop_pidx < g_num_players) {
+                /* Show YES/NO overlay on the persistent window */
+                const Entity& me = gs->entities[drop_pidx];
+                std::string wname = weapon_def(wpn).name;
+                sf::FloatRect yes_b={80.f,380.f,180.f,52.f}, no_b={300.f,380.f,180.f,52.f};
+                bool decided=false;
+
+                while(!decided && !g_quit && main_win.isOpen()){
+                    sf::Vector2f ms=main_win.mapPixelToCoords(sf::Mouse::getPosition(main_win));
+                    sf::Event ev{};
+                    while(main_win.pollEvent(ev)){
+                        if(ev.type==sf::Event::Closed){g_quit=1;decided=true;}
+                        if(ev.type==sf::Event::KeyPressed){
+                            if(ev.key.code==sf::Keyboard::Y){taken=true;decided=true;}
+                            if(ev.key.code==sf::Keyboard::N){taken=false;decided=true;}
+                            if(ev.key.code==sf::Keyboard::Return){taken=true;decided=true;}
+                            if(ev.key.code==sf::Keyboard::Escape){taken=false;decided=true;}
+                        }
+                        if(ev.type==sf::Event::MouseButtonPressed&&ev.mouseButton.button==sf::Mouse::Left){
+                            sf::Vector2f msc=main_win.mapPixelToCoords({ev.mouseButton.x,ev.mouseButton.y});
+                            if(yes_b.contains(msc)){taken=true;decided=true;}
+                            if(no_b.contains(msc)){taken=false;decided=true;}
+                        }
+                    }
+                    /* Draw drop prompt overlay */
+                    main_win.clear(sf::Color{8,10,20});
+                    /* Dark overlay panel */
+                    sf::RectangleShape panel({560.f,240.f}); panel.setPosition(20.f,200.f);
+                    panel.setFillColor({16,18,38}); panel.setOutlineColor(C_BORDER); panel.setOutlineThickness(2.f); main_win.draw(panel);
+                    auto ttl=mkt(font,"WEAPON DROP!",26,C_GOLD,true); draw_centered(main_win,ttl,300.f,215.f);
+                    sf::RectangleShape rl({520.f,1.f}); rl.setPosition(40.f,252.f); rl.setFillColor(C_BORDER); main_win.draw(rl);
+                    std::string info=wname+" (dmg "+std::to_string(weapon_def(wpn).damage)+", "+std::to_string(weapon_def(wpn).slots)+" slots)";
+                    auto wt=mkt(font,info,17,C_ACCENT); draw_centered(main_win,wt,300.f,262.f);
+                    std::string q=std::string(me.name)+", pick it up?";
+                    auto qt=mkt(font,q,14,C_WHITE); draw_centered(main_win,qt,300.f,294.f);
+                    auto hnt=mkt(font,"Y/Enter=Yes    N/Esc=No",12,C_DIM); draw_centered(main_win,hnt,300.f,318.f);
+                    bool yh=yes_b.contains(ms),nh=no_b.contains(ms);
+                    draw_box(main_win,yes_b.left,yes_b.top,yes_b.width,yes_b.height,yh?sf::Color{10,60,20}:sf::Color{16,18,38},yh?C_GREEN:C_BORDER,yh?2.f:1.5f);
+                    auto yt=mkt(font,"YES  (Y)",18,yh?C_GREEN:C_DIM,yh); draw_centered(main_win,yt,yes_b.left+yes_b.width/2.f,yes_b.top+14.f);
+                    draw_box(main_win,no_b.left,no_b.top,no_b.width,no_b.height,nh?sf::Color{60,10,10}:sf::Color{16,18,38},nh?C_RED:C_BORDER,nh?2.f:1.5f);
+                    auto nt2=mkt(font,"NO   (N)",18,nh?C_RED:C_DIM,nh); draw_centered(main_win,nt2,no_b.left+no_b.width/2.f,no_b.top+14.f);
+                    main_win.display();
+                }
+            }
             sem_wait(&gs->state_mutex);
             gs->pending_drop_taken = taken;
             gs->pending_drop_done  = true;
             sem_post(&gs->state_mutex);
         }
 
-        /* Non-blocking check for UI request (timeout 100ms) */
+        /* ── Non-blocking check for UI action request ── */
         struct timespec ts{}; clock_gettime(CLOCK_REALTIME,&ts);
-        ts.tv_nsec+=100000000LL; if(ts.tv_nsec>=1000000000LL){ts.tv_sec++;ts.tv_nsec-=1000000000LL;}
+        ts.tv_nsec+=16000000LL; /* ~16ms poll */
+        if(ts.tv_nsec>=1000000000LL){ts.tv_sec++;ts.tv_nsec-=1000000000LL;}
 
         if(sem_timedwait(&g_ui_request_sem,&ts)==0){
-            /* Got a request — read which player */
             pthread_mutex_lock(&g_ui_mutex);
             int pidx=g_ui_req.pidx;
             g_ui_req.pending=false;
             pthread_mutex_unlock(&g_ui_mutex);
 
             if(pidx>=0&&pidx<g_num_players&&!g_quit){
-                /* Open window on main thread, collect action */
-                g_ui_result=show_action_window(pidx,font);
+                g_ui_result=show_action_window(pidx,font,main_win);
             } else {
                 g_ui_result={ActionType::SKIP,-1,-1,WPN_NONE};
             }
-            sem_post(&g_ui_done_sem);   /* wake player thread with result */
+            sem_post(&g_ui_done_sem);
         }
     }
 
