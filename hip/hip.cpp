@@ -1,21 +1,14 @@
 /*
  * hip.cpp  –  Human Interfacing Process
  *
- * Threading architecture (OS requirement preserved):
- *  - One pthread per player  (player_thread[0..N-1])
- *  - One dispatcher pthread  (watches gs->hip_turn_sem, wakes active player)
- *  - Main thread owns ALL SFML windows (X11/Mesa requires this on WSL2)
+ * Two screens only:
+ *   1. Action picker  — shown when it's your turn (PICKING mode)
+ *   2. Blank/dark wait — shown between turns (no idle HUD drawn)
  *
- * Flow per turn:
- *  1. Arbiter posts hip_turn_sem  →  dispatcher wakes player_sem[i]
- *  2. player_thread[i] wakes, sets g_ui_request = {pidx, ...}
- *  3. player_thread[i] waits on g_ui_done semaphore
- *  4. Main thread sees g_ui_request, opens SFML window, collects action
- *  5. Main thread stores result in g_ui_result, posts g_ui_done
- *  6. player_thread[i] reads g_ui_result, posts action to shared memory
+ * P key → pause menu overlay (Resume / Quit) usable during either screen.
  *
- * This is the ONLY legal way to use SFML on WSL2/X11 with pthreads:
- * windows must be created and driven from the process's main thread.
+ * WSL2 design: ONE persistent sf::RenderWindow, created once, never destroyed.
+ * Main thread drives all SFML. Player pthreads communicate via semaphores.
  */
 
 #include <cstdio>
@@ -25,12 +18,10 @@
 #include <sstream>
 #include <vector>
 #include <cmath>
-#include <atomic>
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <semaphore.h>
 #include <time.h>
@@ -43,27 +34,22 @@
 #include "shared_state.h"
 #include "inventory.h"
 
-/* ════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════
  * Globals
- * ════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════ */
 static SharedState*          gs            = nullptr;
 static int                   g_num_players = 0;
 static volatile sig_atomic_t g_quit        = 0;
 static volatile sig_atomic_t g_stunned     = 0;
 static sem_t                 player_sem[MAX_PLAYERS];
 
-/* ── Main-thread UI request/response channel ── */
-struct UIRequest {
-    int  pidx     = -1;   /* which player needs input; -1 = none pending */
-    bool pending  = false;
-};
-static UIRequest             g_ui_req{};
-static Action                g_ui_result{};
-static sem_t                 g_ui_request_sem;   /* player posts → main wakes */
-static sem_t                 g_ui_done_sem;      /* main posts → player wakes */
-static pthread_mutex_t       g_ui_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* UI channel: player threads → main thread → player threads */
+static volatile int          g_ui_pidx     = -1;
+static Action                g_ui_result   = {};
+static sem_t                 g_ui_req_sem;
+static sem_t                 g_ui_done_sem;
+static pthread_mutex_t       g_ui_mtx      = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── Font paths ── */
 static const char* FONT_PATHS[] = {
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
@@ -72,472 +58,575 @@ static const char* FONT_PATHS[] = {
     nullptr
 };
 
-/* ════════════════════════════════════════════════════════════════════
- * Signal handlers
- * ════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════
+ * Signals
+ * ═══════════════════════════════════════════════════════════════════ */
 static void sig_term(int) { g_quit = 1; }
 
 static void sig_stun(int)
 {
-    /*
-     * SIGUSR1 — Stun mechanic (Section 5).
-     *
-     * This is an async signal handler that halts process execution for
-     * exactly STUN_DURATION seconds. sleep() inside a signal handler
-     * pauses the ENTIRE process — satisfying the "non-blocking interruption"
-     * requirement without any flag polling in the main logic.
-     *
-     * Stamina is PRESERVED (not zeroed) because:
-     *  - The arbiter's scheduler_tick() skips entities with stunned=true
-     *  - So no stamina accumulates, and the pre-stun stamina remains intact
-     *  - After the stun clears, stamina resumes accumulating from where it was
-     *
-     * We capture the stunned entity index NOW (at signal delivery time) so
-     * that clearing stunned refers to the correct entity, not whatever
-     * current_turn is 3 seconds later.
-     */
     g_stunned = 1;
-    int stunned_idx = gs->current_turn;   /* capture at signal time */
-
-    sleep(STUN_DURATION);   /* halts process execution for exactly 3 s */
-
-    /* Restore: clear stun flag, stamina is already preserved */
-    if (stunned_idx >= 0 && stunned_idx < gs->num_players) {
+    int stunned_idx = gs->current_turn;
+    if (stunned_idx >= 0 && stunned_idx < gs->num_players)
+        gs->entities[stunned_idx].stunned = true;
+    sleep(STUN_DURATION);
+    if (stunned_idx >= 0 && stunned_idx < gs->num_players)
         gs->entities[stunned_idx].stunned = false;
-        /* Stamina intentionally NOT reset — spec: "maintaining its previous stamina level" */
-    }
     g_stunned = 0;
 }
 
-/* ════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════
  * Shared memory
- * ════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════ */
 static SharedState* shm_open_existing()
 {
     int fd = -1;
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 50; ++i) {
         fd = shm_open(SHM_NAME, O_RDWR, 0666);
         if (fd >= 0) break;
         usleep(100000);
     }
     if (fd < 0) { perror("hip: shm_open"); exit(1); }
-    void* p = mmap(nullptr, sizeof(SharedState),
-                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* p = mmap(nullptr, sizeof(SharedState), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) { perror("hip: mmap"); exit(1); }
     close(fd);
     return static_cast<SharedState*>(p);
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * UI drawing helpers  (used by main thread only)
- * ════════════════════════════════════════════════════════════════════ */
-static const unsigned UI_W = 820;
-static const unsigned UI_H = 680;
+/* ═══════════════════════════════════════════════════════════════════
+ * Colours & sizes
+ * ═══════════════════════════════════════════════════════════════════ */
+static const unsigned WW = 900, WH = 700;
 
-static const sf::Color C_BG       {  8,  10,  20 };
-static const sf::Color C_PANEL    { 16,  18,  38 };
-static const sf::Color C_BORDER   { 40,  80, 160 };
-static const sf::Color C_BORDER_HI{ 80, 160, 255 };
-static const sf::Color C_GOLD     {220, 185,  80 };
-static const sf::Color C_WHITE    {230, 235, 245 };
-static const sf::Color C_DIM      {100, 110, 130 };
-static const sf::Color C_ACCENT   { 60, 200, 255 };
-static const sf::Color C_GREEN    { 60, 220, 120 };
-static const sf::Color C_RED      {220,  70,  70 };
-static const sf::Color C_HP_P     { 60, 200,  80 };
-static const sf::Color C_HP_E     {220,  60,  60 };
-static const sf::Color C_STAMINA  { 60, 180, 255 };
-static const sf::Color C_SCAN     {  0,  20,  60,  15 };
-static const sf::Color C_SELECT   { 20,  50, 100 };
-static const sf::Color C_ULTIMATE {255, 100, 200 };
+static const sf::Color BG     {  8, 10, 20};
+static const sf::Color PANEL  { 16, 18, 38};
+static const sf::Color BDR    { 40, 80,160};
+static const sf::Color BDR_HI { 80,160,255};
+static const sf::Color GOLD   {220,185, 80};
+static const sf::Color WHITE  {230,235,245};
+static const sf::Color DIM    {100,110,130};
+static const sf::Color ACCENT { 60,200,255};
+static const sf::Color GREEN  { 60,220,120};
+static const sf::Color RED    {220, 70, 70};
+static const sf::Color ORANGE {255,140,  0};
+static const sf::Color PURPLE {180,100,255};
+static const sf::Color HP_P   { 60,200, 80};
+static const sf::Color HP_E   {220, 60, 60};
+static const sf::Color STAM   { 60,180,255};
+static const sf::Color SCAN   {  0, 20, 60, 15};
+static const sf::Color SEL    { 20, 50,100};
+static const sf::Color ULT    {255,100,200};
 
-static sf::Text mkt(const sf::Font& f, const std::string& s,
-                    unsigned sz, sf::Color c, bool bold=false)
+/* ─── helpers ─── */
+static sf::Text T(const sf::Font& f, const std::string& s,
+                  unsigned sz, sf::Color c, bool b=false)
 {
     sf::Text t; t.setFont(f); t.setString(s);
     t.setCharacterSize(sz); t.setFillColor(c);
-    if (bold) t.setStyle(sf::Text::Bold);
+    if (b) t.setStyle(sf::Text::Bold);
     return t;
 }
 
-static void draw_centered(sf::RenderTarget& rt, sf::Text t, float cx, float y)
+static void Tcx(sf::RenderTarget& r, sf::Text t, float cx, float y)
 {
     sf::FloatRect b = t.getLocalBounds();
-    t.setOrigin(b.left+b.width/2.f, b.top);
-    t.setPosition(cx, y); rt.draw(t);
+    t.setOrigin(b.left + b.width/2.f, b.top);
+    t.setPosition(cx, y);
+    r.draw(t);
 }
 
-static void draw_box(sf::RenderTarget& rt,
-                     float x, float y, float w, float h,
-                     sf::Color fill, sf::Color border, float thick=1.5f)
+static void Box(sf::RenderTarget& r, float x, float y, float w, float h,
+                sf::Color fill, sf::Color bdr, float th=1.5f)
 {
-    sf::RectangleShape r({w,h}); r.setPosition(x,y);
-    r.setFillColor(fill); r.setOutlineColor(border);
-    r.setOutlineThickness(thick); rt.draw(r);
+    sf::RectangleShape s({w,h}); s.setPosition(x,y);
+    s.setFillColor(fill); s.setOutlineColor(bdr);
+    s.setOutlineThickness(th); r.draw(s);
 }
 
-static void draw_bar(sf::RenderTarget& rt,
-                     float x, float y, float w, float h,
-                     float val, float maxv, sf::Color col)
+static void Bar(sf::RenderTarget& r, float x, float y, float w, float h,
+                float v, float mx, sf::Color c)
 {
-    draw_box(rt,x,y,w,h,{30,30,50},C_BORDER,1.f);
-    if (maxv>0.f) {
-        float r=val/maxv; if(r<0)r=0; if(r>1)r=1;
-        draw_box(rt,x,y,w*r,h,col,col,0.f);
+    Box(r,x,y,w,h,{30,30,50},BDR,1.f);
+    if (mx > 0) {
+        float rt = v/mx; if(rt<0)rt=0; if(rt>1)rt=1;
+        Box(r,x,y,w*rt,h,c,c,0.f);
     }
 }
 
-static void draw_corners(sf::RenderTarget& rt,
-                          float x, float y, float w, float h, float sz=10.f)
+static void Corners(sf::RenderTarget& r, float x, float y, float w, float h, float sz=10.f)
 {
-    sf::RectangleShape r; r.setFillColor(C_GOLD);
+    sf::RectangleShape s; s.setFillColor(GOLD);
     auto seg=[&](float px,float py,float pw,float ph){
-        r.setSize({pw,ph}); r.setPosition(px,py); rt.draw(r);};
-    seg(x,y,sz,2);    seg(x,y,2,sz);
+        s.setSize({pw,ph}); s.setPosition(px,py); r.draw(s);};
+    seg(x,y,sz,2);      seg(x,y,2,sz);
     seg(x+w-sz,y,sz,2); seg(x+w-2,y,2,sz);
     seg(x,y+h-2,sz,2);  seg(x,y+h-sz,2,sz);
     seg(x+w-sz,y+h-2,sz,2); seg(x+w-2,y+h-sz,2,sz);
 }
 
-static void draw_scanlines(sf::RenderTarget& rt)
+static void Scanlines(sf::RenderTarget& r)
 {
-    sf::RectangleShape l({static_cast<float>(UI_W),1.f}); l.setFillColor(C_SCAN);
-    for(unsigned y=0;y<UI_H;y+=4){l.setPosition(0,static_cast<float>(y));rt.draw(l);}
+    sf::RectangleShape l({(float)WW,1.f}); l.setFillColor(SCAN);
+    for(unsigned y=0;y<WH;y+=4){l.setPosition(0,(float)y);r.draw(l);}
 }
 
-
-
-
-/* ════════════════════════════════════════════════════════════════════
- * show_action_window()
- * Called ONLY from the main thread.
- * Opens window, runs event loop, returns chosen Action.
- * ════════════════════════════════════════════════════════════════════ */
-static Action show_action_window(int pidx, const sf::Font& font, sf::RenderWindow& main_win)
+static void Grid(sf::RenderTarget& r)
 {
-    /* snapshot under lock */
-    sem_wait(&gs->state_mutex);
-    Entity me = gs->entities[pidx];
-    Entity ents[MAX_ENTITIES];
-    memcpy(ents, gs->entities, sizeof(ents));
-    int np = gs->num_players, nte = gs->total_entities;
-    sem_post(&gs->state_mutex);
+    sf::RectangleShape l({(float)WW,1.f}); l.setFillColor({20,30,60,30});
+    for(unsigned y=0;y<WH;y+=32){l.setPosition(0,(float)y);r.draw(l);}
+    l.setSize({1.f,(float)WH});
+    for(unsigned x=0;x<WW;x+=32){l.setPosition((float)x,0);r.draw(l);}
+}
 
-    bool can_ultimate = inv_has_weapon(me, WPN_SOLAR_CORE) &&
-                        inv_has_weapon(me, WPN_LUNAR_BLADE);
+/* ═══════════════════════════════════════════════════════════════════
+ * draw_pause_menu()
+ *
+ * Draws a fullscreen dimmed overlay with Resume / Quit buttons.
+ * Returns true if "Quit" was chosen, false if "Resume".
+ * Called only from the main thread, inside the event loop.
+ * ═══════════════════════════════════════════════════════════════════ */
+static bool draw_pause_menu(sf::RenderWindow& win, const sf::Font& font)
+{
+    sf::FloatRect resume_b = {WW/2.f-130.f, WH/2.f-10.f,  260.f, 54.f};
+    sf::FloatRect quit_b   = {WW/2.f-130.f, WH/2.f+72.f,  260.f, 54.f};
 
-    /* ── Reuse the persistent main window (WSL2: never create/destroy windows) ── */
-    sf::RenderWindow& win = main_win;
-    win.setTitle(std::string(me.name) + " - Choose Action");
-    sf::Clock clk;
-
-    /* ── Build action button list ── */
-    const float BTN_X=30.f, BTN_W=340.f, BTN_H=52.f, BTN_GAP=8.f;
-    struct Btn {
-        sf::FloatRect b; std::string lbl,sub; sf::Color acc;
-        bool enabled=true, hov=false;
-    };
-    std::vector<Btn> btns;
-    float by=220.f;
-    auto add=[&](const std::string& l,const std::string& s,sf::Color a,bool en=true){
-        btns.push_back({{BTN_X,by,BTN_W,BTN_H},l,s,a,en});
-        by+=BTN_H+BTN_GAP;
-    };
-    add("1  Strike",      "Direct damage to enemy",          C_RED);
-    add("2  Exhaust",     "Drain enemy stamina",             {255,140,0});
-    bool has_inv=false;
-    for(int s=0;s<INVENTORY_SLOTS;s++) if(me.inventory.slots[s]!=WPN_NONE){has_inv=true;break;}
-    add("3  Use Weapon",  "Attack with inventory weapon",    C_ACCENT, has_inv);
-    add("4  Swap In",     "Retrieve from Long-Term Storage", {180,100,255}, me.lts.count>0);
-    add("5  Heal",        "Restore 10% of max HP",           C_GREEN);
-    add("6  Skip",        "50% stamina refund",              C_DIM);
-    if(can_ultimate)
-        add("7  ULTIMATE","Solar Core + Lunar Blade attack", C_ULTIMATE);
-    add("0  Quit Game",   "Send SIGTERM to arbiter",         C_RED);
-
-    /* ── Enemy buttons ── */
-    struct EBtn { sf::FloatRect b; int idx; bool hov=false; };
-    std::vector<EBtn> ebtns;
-    const float EB_X=390.f,EB_W=400.f,EB_H=38.f,EB_G=6.f;
-    { float ey=220.f;
-      for(int i=np;i<nte;i++) if(ents[i].alive){
-          ebtns.push_back({{EB_X,ey,EB_W,EB_H},i}); ey+=EB_H+EB_G; }}
-
-    /* ── Weapon buttons ── */
-    struct WBtn { sf::FloatRect b; int slot; WeaponID wid; bool hov=false; };
-    std::vector<WBtn> wbtns;
-    { float wy=220.f; bool vis[INVENTORY_SLOTS]={};
-      for(int s=0;s<INVENTORY_SLOTS;s++){
-          if(vis[s]) continue;
-          WeaponID w=me.inventory.slots[s]; if(w==WPN_NONE) continue;
-          if(inv_first_slot_of(me.inventory,s)!=s) continue;
-          wbtns.push_back({{BTN_X,wy,BTN_W,BTN_H},s,w}); wy+=BTN_H+BTN_GAP;
-          for(int k=s;k<INVENTORY_SLOTS&&me.inventory.slots[k]==w;k++) vis[k]=true; }}
-
-    /* ── LTS buttons ── */
-    struct LBtn { sf::FloatRect b; int li; WeaponID wid; bool hov=false; };
-    std::vector<LBtn> lbtns;
-    { float ly=220.f;
-      for(int i=0;i<me.lts.count;i++){
-          lbtns.push_back({{BTN_X,ly,BTN_W,BTN_H},i,me.lts.weapons[i]}); ly+=BTN_H+BTN_GAP; }}
-
-    enum class St { ACTION, ENEMY, WEAPON, LTS };
-    St state=St::ACTION;
-    int sel_act=-1, sel_wpn_slot=-1;
-    std::string status;
-    Action result{};
-
-
-    while(!g_quit&&gs->phase!=GamePhase::GAME_OVER){
-        sf::Vector2f ms=win.mapPixelToCoords(sf::Mouse::getPosition(win));
-        float t=clk.getElapsedTime().asSeconds();
-
-        /* refresh snapshot */
-        sem_wait(&gs->state_mutex);
-        memcpy(ents,gs->entities,sizeof(ents));
-        sem_post(&gs->state_mutex);
-
-        for(auto& b:btns)  b.hov=b.b.contains(ms);
-        for(auto& b:ebtns) b.hov=b.b.contains(ms);
-        for(auto& b:wbtns) b.hov=b.b.contains(ms);
-        for(auto& b:lbtns) b.hov=b.b.contains(ms);
+    while (win.isOpen() && !g_quit) {
+        sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
 
         sf::Event ev{};
-        while(win.pollEvent(ev)){
-            if(ev.type==sf::Event::Closed){
-                result={ActionType::SKIP,-1,-1,WPN_NONE};
-                return result;
+        while (win.pollEvent(ev)) {
+            if (ev.type == sf::Event::Closed) { g_quit=1; return true; }
+            if (ev.type == sf::Event::KeyPressed) {
+                if (ev.key.code == sf::Keyboard::P ||
+                    ev.key.code == sf::Keyboard::Escape) return false; /* resume */
             }
-            if(ev.type==sf::Event::KeyPressed&&ev.key.code==sf::Keyboard::Escape){
-                if(state!=St::ACTION){ state=St::ACTION; sel_act=-1; status=""; }
-            }
-            if(ev.type==sf::Event::MouseButtonPressed&&
-               ev.mouseButton.button==sf::Mouse::Left){
-
-                if(state==St::ACTION){
-                    for(int i=0;i<(int)btns.size();i++){
-                        if(!btns[i].b.contains(ms)||!btns[i].enabled) continue;
-                        sel_act=i;
-                        const std::string& lbl=btns[i].lbl;
-                        if(lbl[0]=='0'){ kill(gs->arbiter_pid,SIGTERM); g_quit=1;
-                            result={ActionType::SKIP,-1,-1,WPN_NONE}; return result; }
-                        if(lbl.find("Strike") !=std::string::npos){state=St::ENEMY;  status="Select a target enemy";}
-                        else if(lbl.find("Exhaust")!=std::string::npos){state=St::ENEMY; status="Select enemy to exhaust";}
-                        else if(lbl.find("Weapon") !=std::string::npos){state=St::WEAPON;status="Select a weapon";}
-                        else if(lbl.find("Swap")   !=std::string::npos){state=St::LTS;   status="Select from Long-Term Storage";}
-                        else if(lbl.find("Heal")   !=std::string::npos){result={ActionType::HEAL,-1,-1,WPN_NONE};win.close();return result;}
-                        else if(lbl.find("Skip")   !=std::string::npos){result={ActionType::SKIP,-1,-1,WPN_NONE};win.close();return result;}
-                        else if(lbl.find("ULTIMATE")!=std::string::npos){result={ActionType::ULTIMATE,-1,-1,WPN_NONE};win.close();return result;}
-                        break;
-                    }
-                }
-                else if(state==St::ENEMY){
-                    for(auto& eb:ebtns){
-                        if(!eb.b.contains(ms)) continue;
-                        ActionType at=ActionType::STRIKE;
-                        if(sel_act>=0){
-                            const std::string& l=btns[sel_act].lbl;
-                            if(l.find("Exhaust")!=std::string::npos) at=ActionType::EXHAUST;
-                            else if(l.find("Weapon")!=std::string::npos) at=ActionType::USE_WEAPON;
-                        }
-                        result={at,eb.idx,sel_wpn_slot,WPN_NONE};
-                        return result;
-                    }
-                }
-                else if(state==St::WEAPON){
-                    for(auto& wb:wbtns){
-                        if(!wb.b.contains(ms)) continue;
-                        sel_wpn_slot=wb.slot; state=St::ENEMY; status="Now select a target enemy"; break;
-                    }
-                }
-                else if(state==St::LTS){
-                    for(auto& lb:lbtns){
-                        if(!lb.b.contains(ms)) continue;
-                        result={ActionType::SWAP_IN,-1,-1,lb.wid}; return result;
-                    }
-                }
+            if (ev.type == sf::Event::MouseButtonPressed &&
+                ev.mouseButton.button == sf::Mouse::Left) {
+                sf::Vector2f msc = win.mapPixelToCoords({ev.mouseButton.x, ev.mouseButton.y});
+                if (resume_b.contains(msc)) return false;
+                if (quit_b.contains(msc))   { kill(gs->arbiter_pid, SIGTERM); g_quit=1; return true; }
             }
         }
 
-        /* ══ DRAW ══ */
-        win.clear(C_BG);
+        /* Draw the dim overlay on top of whatever was previously rendered */
+        sf::RectangleShape dim({(float)WW,(float)WH});
+        dim.setFillColor({0,0,0,180}); win.draw(dim);
 
-        /* grid */
-        {sf::RectangleShape gl({static_cast<float>(UI_W),1.f}); gl.setFillColor({20,30,60,30});
-         for(unsigned gy=0;gy<UI_H;gy+=32){gl.setPosition(0,static_cast<float>(gy));win.draw(gl);}
-         gl.setSize({1.f,static_cast<float>(UI_H)});
-         for(unsigned gx=0;gx<UI_W;gx+=32){gl.setPosition(static_cast<float>(gx),0);win.draw(gl);}
+        /* Panel */
+        Box(win, WW/2.f-180.f, WH/2.f-80.f, 360.f, 240.f, PANEL, GOLD, 2.f);
+        Corners(win, WW/2.f-180.f, WH/2.f-80.f, 360.f, 240.f, 14.f);
+
+        Tcx(win, T(font,"PAUSED",28,GOLD,true), WW/2.f, WH/2.f-72.f);
+
+        sf::RectangleShape rl({300.f,1.f}); rl.setPosition(WW/2.f-150.f, WH/2.f-32.f);
+        rl.setFillColor(BDR); win.draw(rl);
+
+        /* Resume button */
+        bool rh = resume_b.contains(ms);
+        Box(win,resume_b.left,resume_b.top,resume_b.width,resume_b.height,
+            rh?sf::Color{10,40,90}:PANEL, rh?ACCENT:BDR, rh?2.f:1.5f);
+        Tcx(win,T(font,"RESUME  (P / Esc)",16,rh?WHITE:DIM,rh), WW/2.f, resume_b.top+16.f);
+
+        /* Quit button */
+        bool qh = quit_b.contains(ms);
+        Box(win,quit_b.left,quit_b.top,quit_b.width,quit_b.height,
+            qh?sf::Color{80,10,10}:PANEL, qh?RED:BDR, qh?2.f:1.5f);
+        Tcx(win,T(font,"QUIT GAME",16,qh?WHITE:DIM,qh), WW/2.f, quit_b.top+16.f);
+
+        Scanlines(win);
+        win.display();
+    }
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * HIP UI (owned by main thread entirely)
+ * ═══════════════════════════════════════════════════════════════════ */
+enum class UIMode { WAIT, PICKING };
+
+struct HipUI {
+    sf::Font font;
+    UIMode   mode    = UIMode::WAIT;
+    int      pidx    = -1;
+    float    clock_t = 0.f;
+
+    enum class Step { ACTION, WEAPON, ENEMY, LTS };
+    Step  step         = Step::ACTION;
+    int   sel_act      = -1;
+    int   sel_wpn_slot = -1;
+    std::string status;
+
+    Entity me{};
+    Entity ents[MAX_ENTITIES]{};
+    int    np=0, nte=0;
+    bool   can_ult=false;
+
+    struct Btn { sf::FloatRect b; std::string lbl,sub; sf::Color acc; bool enabled=true; };
+    std::vector<Btn> action_btns;
+
+    struct EBtn { sf::FloatRect b; int idx; };
+    std::vector<EBtn> enemy_btns;
+
+    struct WBtn { sf::FloatRect b; int slot; WeaponID wid; };
+    std::vector<WBtn> wpn_btns;
+
+    struct LBtn { sf::FloatRect b; int li; WeaponID wid; };
+    std::vector<LBtn> lts_btns;
+
+    void load_font() {
+        for (int i=0; FONT_PATHS[i]; ++i)
+            if (font.loadFromFile(FONT_PATHS[i])) return;
+    }
+
+    void begin_turn(int p) {
+        pidx=p; mode=UIMode::PICKING;
+        step=Step::ACTION; sel_act=-1; sel_wpn_slot=-1; status="";
+
+        sem_wait(&gs->state_mutex);
+        me=gs->entities[p];
+        memcpy(ents, gs->entities, sizeof(ents));
+        np=gs->num_players; nte=gs->total_entities;
+        sem_post(&gs->state_mutex);
+
+        can_ult = inv_has_weapon(me,WPN_SOLAR_CORE) &&
+                  inv_has_weapon(me,WPN_LUNAR_BLADE);
+
+        action_btns.clear();
+        float by=220.f;
+        const float BW=340.f, BH=52.f, BG=8.f, BX=30.f;
+        auto add=[&](const std::string& l, const std::string& s,
+                      sf::Color a, bool en=true){
+            action_btns.push_back({{BX,by,BW,BH},l,s,a,en}); by+=BH+BG;};
+
+        add("1  Strike",    "Direct damage to enemy",           RED);
+        add("2  Exhaust",   "Drain enemy stamina",              ORANGE);
+        bool hi=false;
+        for(int s=0;s<INVENTORY_SLOTS;s++) if(me.inventory.slots[s]!=WPN_NONE){hi=true;break;}
+        add("3  Use Weapon","Attack with inventory weapon",     ACCENT, hi);
+        add("4  Swap In",   "Retrieve from Long-Term Storage",  PURPLE, me.lts.count>0);
+        add("5  Heal",      "Restore 10% of max HP",            GREEN);
+        add("6  Skip",      "50% stamina refund",               DIM);
+        if (can_ult) add("7  ULTIMATE","Solar Core + Lunar Blade",ULT);
+        add("0  Quit Game", "Send SIGTERM to arbiter",          RED);
+
+        enemy_btns.clear();
+        float ey=238.f;
+        for(int i=np;i<nte;i++) if(ents[i].alive){
+            enemy_btns.push_back({{400.f,ey,WW-420.f,38.f},i}); ey+=44.f;}
+
+        wpn_btns.clear();
+        float wy=238.f; bool vis[INVENTORY_SLOTS]={};
+        for(int s=0;s<INVENTORY_SLOTS;s++){
+            if(vis[s]) continue;
+            WeaponID w=me.inventory.slots[s]; if(w==WPN_NONE) continue;
+            if(inv_first_slot_of(me.inventory,s)!=s) continue;
+            wpn_btns.push_back({{30.f,wy,340.f,42.f},s,w}); wy+=48.f;
+            for(int k=s;k<INVENTORY_SLOTS&&me.inventory.slots[k]==w;k++) vis[k]=true;}
+
+        lts_btns.clear();
+        float ly=238.f;
+        for(int i=0;i<me.lts.count;i++){
+            lts_btns.push_back({{30.f,ly,340.f,42.f},i,me.lts.weapons[i]}); ly+=48.f;}
+    }
+
+    bool handle_click(sf::Vector2f ms, Action& out) {
+        if (step==Step::ACTION){
+            for(int i=0;i<(int)action_btns.size();i++){
+                auto& b=action_btns[i];
+                if(!b.b.contains(ms)||!b.enabled) continue;
+                sel_act=i;
+                const std::string& l=b.lbl;
+                if(l[0]=='0'){ kill(gs->arbiter_pid,SIGTERM); g_quit=1;
+                    out={ActionType::SKIP,-1,-1,WPN_NONE}; return true;}
+                if(l.find("Strike") !=std::string::npos){step=Step::ENEMY; status="Click an enemy to strike";}
+                else if(l.find("Exhaust")!=std::string::npos){step=Step::ENEMY; status="Click an enemy to exhaust";}
+                else if(l.find("Weapon") !=std::string::npos){step=Step::WEAPON;status="Click a weapon to use";}
+                else if(l.find("Swap")   !=std::string::npos){step=Step::LTS;   status="Click weapon from storage";}
+                else if(l.find("Heal")   !=std::string::npos){out={ActionType::HEAL,-1,-1,WPN_NONE};return true;}
+                else if(l.find("Skip")   !=std::string::npos){out={ActionType::SKIP,-1,-1,WPN_NONE};return true;}
+                else if(l.find("ULTIMATE")!=std::string::npos){out={ActionType::ULTIMATE,-1,-1,WPN_NONE};return true;}
+                return false;
+            }
+        }
+        if (step==Step::ENEMY){
+            for(auto& eb:enemy_btns){
+                if(!eb.b.contains(ms)) continue;
+                ActionType at=ActionType::STRIKE;
+                if(sel_act>=0){
+                    const std::string& l=action_btns[sel_act].lbl;
+                    if(l.find("Exhaust")!=std::string::npos) at=ActionType::EXHAUST;
+                    else if(l.find("Weapon")!=std::string::npos) at=ActionType::USE_WEAPON;
+                }
+                out={at,eb.idx,sel_wpn_slot,WPN_NONE}; return true;
+            }
+        }
+        if (step==Step::WEAPON){
+            for(auto& wb:wpn_btns){
+                if(!wb.b.contains(ms)) continue;
+                sel_wpn_slot=wb.slot; step=Step::ENEMY;
+                status="Now click a target enemy"; return false;
+            }
+        }
+        if (step==Step::LTS){
+            for(auto& lb:lts_btns){
+                if(!lb.b.contains(ms)) continue;
+                out={ActionType::SWAP_IN,-1,-1,lb.wid}; return true;
+            }
+        }
+        return false;
+    }
+
+    void handle_esc(){
+        if(step!=Step::ACTION){step=Step::ACTION;sel_act=-1;status="";}
+    }
+
+    /* ── draw_wait: minimal dark screen while not our turn ── */
+    void draw_wait(sf::RenderWindow& win){
+        win.clear(BG);
+        Grid(win);
+
+        /* ── Title ── */
+        Tcx(win, T(font,"CHRONO RIFT",28,GOLD,true), WW/2.f, 14.f);
+
+        /* ── Snapshot under lock ── */
+        sem_wait(&gs->state_mutex);
+        int np=gs->num_players, ne=gs->num_enemies;
+        int ct=gs->current_turn;
+        int kills=gs->enemies_killed;
+        Entity ents[MAX_ENTITIES];
+        memcpy(ents, gs->entities, sizeof(ents));
+        sem_post(&gs->state_mutex);
+
+        /* ── Kill counter ── */
+        char kb[32]; snprintf(kb,sizeof(kb),"Kills: %d / %d",kills,MAX_ENEMIES_KILL);
+        Tcx(win, T(font,kb,13,sf::Color{80,200,80}), WW/2.f, 48.f);
+
+        float col_w = (WW-40.f)/2.f;
+        /* ── Players column ── */
+        auto ph=T(font,"PLAYERS",12,sf::Color{100,120,180}); ph.setPosition(24.f,74.f); win.draw(ph);
+        float py=96.f;
+        for(int i=0;i<np;i++){
+            const Entity& e=ents[i];
+            bool active=(ct==i);
+            sf::Color nc=!e.alive?sf::Color{80,40,40}:active?GOLD:WHITE;
+            char ln[80]; snprintf(ln,sizeof(ln),"%s%s  HP:%d/%d  ST:%.0f",
+                e.name, active?" <":""  , e.hp,e.max_hp,e.stamina);
+            auto t=T(font,ln,13,nc); t.setPosition(24.f,py); win.draw(t);
+            /* HP bar */
+            float bw=col_w-20.f, fill=e.max_hp>0?(float)e.hp/e.max_hp*bw:0.f;
+            sf::RectangleShape bg({bw,5.f}); bg.setPosition(24.f,py+17.f);
+            bg.setFillColor({30,40,30}); win.draw(bg);
+            sf::RectangleShape bar({fill,5.f}); bar.setPosition(24.f,py+17.f);
+            bar.setFillColor({60,200,80}); win.draw(bar);
+            /* Stamina bar */
+            float sf2=e.max_stamina>0?e.stamina/e.max_stamina*bw:0.f;
+            sf::RectangleShape sbg({bw,3.f}); sbg.setPosition(24.f,py+24.f);
+            sbg.setFillColor({20,20,50}); win.draw(sbg);
+            sf::RectangleShape sbar({sf2,3.f}); sbar.setPosition(24.f,py+24.f);
+            sbar.setFillColor({60,140,255}); win.draw(sbar);
+            py+=36.f;
         }
 
-        /* title */
-        {float pulse=0.5f+0.5f*std::sin(t*2.f);
-         sf::RectangleShape glow({static_cast<float>(UI_W),52.f});
-         glow.setFillColor({10,20,60,static_cast<sf::Uint8>(20+int(pulse*15))}); win.draw(glow);
-         auto ti=mkt(font,std::string(me.name)+"'s Turn",22,C_GOLD,true); ti.setPosition(20.f,10.f); win.draw(ti);
-         const char* ph= state==St::ACTION?"Choose Action":state==St::ENEMY?"Choose Target":
-                         state==St::WEAPON?"Choose Weapon":"Choose from Storage";
-         auto pt=mkt(font,ph,14,C_ACCENT); sf::FloatRect pb=pt.getLocalBounds();
-         pt.setPosition(UI_W-pb.width-20.f,16.f); win.draw(pt);
-         sf::RectangleShape rule({static_cast<float>(UI_W)-40.f,1.f});
-         rule.setPosition(20.f,50.f); rule.setFillColor(C_BORDER); win.draw(rule);}
-
-        /* stats panel */
-        {draw_box(win,20.f,58.f,UI_W-40.f,148.f,C_PANEL,C_BORDER);
-         draw_corners(win,20.f,58.f,UI_W-40.f,148.f);
-         auto nm=mkt(font,me.name,16,C_WHITE,true); nm.setPosition(34.f,66.f); win.draw(nm);
-         /* HP */
-         std::ostringstream hps; hps<<me.hp<<"/"<<me.max_hp;
-         auto hl=mkt(font,"HP",11,C_DIM); hl.setPosition(34.f,90.f); win.draw(hl);
-         draw_bar(win,60.f,92.f,300.f,14.f,(float)me.hp,(float)me.max_hp,C_HP_P);
-         auto hv=mkt(font,hps.str(),11,C_WHITE); hv.setPosition(368.f,90.f); win.draw(hv);
-         /* Stamina */
-         std::ostringstream sts; sts<<(int)me.stamina<<"/"<<me.max_stamina;
-         auto sl=mkt(font,"ST",11,C_DIM); sl.setPosition(34.f,114.f); win.draw(sl);
-         draw_bar(win,60.f,116.f,300.f,14.f,me.stamina,(float)me.max_stamina,C_STAMINA);
-         auto sv=mkt(font,sts.str(),11,C_WHITE); sv.setPosition(368.f,114.f); win.draw(sv);
-         /* stats */
-         std::ostringstream ss2; ss2<<"DMG: "<<me.damage<<"   SPD: "<<me.speed;
-         auto sv2=mkt(font,ss2.str(),13,C_DIM); sv2.setPosition(34.f,138.f); win.draw(sv2);
-         /* inventory quick view */
-         float ix=450.f,iy=68.f;
-         auto il=mkt(font,"INVENTORY",11,C_DIM); il.setPosition(ix,iy); win.draw(il); iy+=16.f;
-         bool vis[INVENTORY_SLOTS]={},any=false;
-         for(int s=0;s<INVENTORY_SLOTS;s++){
-             if(vis[s]) continue;
-             WeaponID w=me.inventory.slots[s];
-             if(w==WPN_NONE) continue;
-             if(inv_first_slot_of(me.inventory,s)!=s) continue;
-             std::ostringstream ws; ws<<"["<<s<<"] "<<weapon_def(w).name<<" (dmg "<<weapon_def(w).damage<<")";
-             auto wt=mkt(font,ws.str(),12,C_ACCENT); wt.setPosition(ix,iy); win.draw(wt); iy+=16.f; any=true;
-             for(int k=s;k<INVENTORY_SLOTS&&me.inventory.slots[k]==w;k++) { vis[k]=true; }}
-         if(!any){auto et=mkt(font,"(empty)",12,C_DIM); et.setPosition(ix,iy); win.draw(et); iy+=16.f;}
-         if(me.lts.count>0){
-             auto ll=mkt(font,"LTS:",11,C_DIM); ll.setPosition(ix,iy); win.draw(ll); iy+=14.f;
-             for(int i=0;i<me.lts.count;i++){
-                 auto lt=mkt(font,weapon_def(me.lts.weapons[i]).name,11,{180,100,255});
-                 lt.setPosition(ix+8.f,iy); win.draw(lt); iy+=14.f;}}
-         if(can_ultimate){auto ut=mkt(font,"*** ULTIMATE AVAILABLE ***",13,C_ULTIMATE,true); ut.setPosition(34.f,158.f); win.draw(ut);}
+        /* ── Enemies column ── */
+        auto eh=T(font,"ENEMIES",12,sf::Color{180,80,80}); eh.setPosition(WW/2.f+4.f,74.f); win.draw(eh);
+        float ey=96.f;
+        for(int i=0;i<ne;i++){
+            const Entity& e=ents[np+i];
+            bool active=(ct==np+i);
+            sf::Color nc=!e.alive?sf::Color{60,30,30}:active?sf::Color{255,160,60}:sf::Color{200,160,160};
+            char ln[80]; snprintf(ln,sizeof(ln),"%s%s  HP:%d  ST:%.0f",
+                e.name,active?" <":"",e.hp,e.stamina);
+            auto t=T(font,ln,13,nc); t.setPosition(WW/2.f+4.f,ey); win.draw(t);
+            float bw=col_w-20.f, fill=e.max_hp>0?(float)e.hp/e.max_hp*bw:0.f;
+            sf::RectangleShape bg({bw,5.f}); bg.setPosition(WW/2.f+4.f,ey+17.f);
+            bg.setFillColor({40,20,20}); win.draw(bg);
+            sf::RectangleShape bar({fill,5.f}); bar.setPosition(WW/2.f+4.f,ey+17.f);
+            bar.setFillColor({220,60,60}); win.draw(bar);
+            ey+=36.f;
         }
 
-        /* left panel header */
-        draw_box(win,20.f,214.f,360.f,UI_H-224.f,C_PANEL,C_BORDER);
-        draw_corners(win,20.f,214.f,360.f,UI_H-224.f);
-        {const char* sec=state==St::WEAPON?"SELECT WEAPON":state==St::LTS?"LONG-TERM STORAGE":"ACTIONS";
-         auto sl2=mkt(font,sec,11,C_DIM); sl2.setPosition(34.f,220.f); win.draw(sl2);}
-
-        if(state==St::ACTION){
-            for(auto& b:btns){
-                sf::Color fill =b.hov&&b.enabled?sf::Color{15,25,55}:C_PANEL;
-                sf::Color bord =b.hov&&b.enabled?C_BORDER_HI:b.enabled?C_BORDER:sf::Color{25,28,50};
-                sf::Color tcol =!b.enabled?C_DIM:b.hov?C_WHITE:sf::Color{160,170,190};
-                draw_box(win,b.b.left,b.b.top,b.b.width,b.b.height,fill,bord,b.hov&&b.enabled?2.f:1.5f);
-                if(b.enabled){sf::RectangleShape bar({3.f,b.b.height-8.f});
-                    bar.setPosition(b.b.left+4.f,b.b.top+4.f);
-                    bar.setFillColor(b.hov?b.acc:sf::Color{b.acc.r,b.acc.g,b.acc.b,80}); win.draw(bar);}
-                auto lt=mkt(font,b.lbl,15,tcol,b.hov&&b.enabled); lt.setPosition(b.b.left+14.f,b.b.top+7.f); win.draw(lt);
-                if(!b.sub.empty()){auto st=mkt(font,b.sub,11,b.hov?C_ACCENT:C_DIM); st.setPosition(b.b.left+14.f,b.b.top+b.b.height-18.f); win.draw(st);}
-            }
-        } else if(state==St::WEAPON){
-            for(auto& wb:wbtns){
-                // Grey out weapon that was just swapped in (unusable this turn)
-                bool locked = (me.swap_in_slot >= 0 && me.swap_in_slot == wb.slot);
-                sf::Color fill = locked ? sf::Color{20,15,15}
-                                : wb.hov ? sf::Color{15,25,55} : C_PANEL;
-                sf::Color bord = locked ? sf::Color{80,40,40}
-                                : wb.hov ? C_BORDER_HI : C_BORDER;
-                draw_box(win,wb.b.left,wb.b.top,wb.b.width,wb.b.height,fill,bord,wb.hov?2.f:1.5f);
-                if(!locked && wb.hov){sf::RectangleShape bar({3.f,wb.b.height-8.f});
-                    bar.setPosition(wb.b.left+4.f,wb.b.top+4.f);
-                    bar.setFillColor(C_ACCENT); win.draw(bar);}
-                std::ostringstream ws;
-                ws<<weapon_def(wb.wid).name<<"  dmg "<<weapon_def(wb.wid).damage
-                  <<"  ["<<weapon_def(wb.wid).slots<<" slots]";
-                if(locked) ws<<" (next turn only)";
-                sf::Color txtCol = locked ? sf::Color{100,70,70}
-                                 : wb.hov ? C_WHITE : sf::Color{160,170,190};
-                auto lt=mkt(font,ws.str(),15,txtCol,wb.hov&&!locked);
-                lt.setPosition(wb.b.left+14.f,wb.b.top+7.f); win.draw(lt);
-                std::ostringstream ss2; ss2<<"slot "<<wb.slot;
-                auto st=mkt(font,ss2.str(),11,locked?sf::Color{80,50,50}:wb.hov?C_ACCENT:C_DIM);
-                st.setPosition(wb.b.left+14.f,wb.b.top+wb.b.height-18.f); win.draw(st);
-            }
-            auto bk=mkt(font,"ESC to go back",11,C_DIM); bk.setPosition(34.f,by+10.f); win.draw(bk);
-        } else if(state==St::LTS){
-            for(auto& lb:lbtns){
-                sf::Color fill=lb.hov?sf::Color{15,25,55}:C_PANEL;
-                sf::Color bord=lb.hov?C_BORDER_HI:C_BORDER;
-                draw_box(win,lb.b.left,lb.b.top,lb.b.width,lb.b.height,fill,bord,lb.hov?2.f:1.5f);
-                std::ostringstream ls;
-                ls<<weapon_def(lb.wid).name<<"  dmg "<<weapon_def(lb.wid).damage;
-                auto lt=mkt(font,ls.str(),15,lb.hov?C_WHITE:sf::Color{160,170,190},lb.hov);
-                lt.setPosition(lb.b.left+14.f,lb.b.top+7.f); win.draw(lt);
-            }
-            auto bk=mkt(font,"ESC to go back",11,C_DIM); bk.setPosition(34.f,by+10.f); win.draw(bk);
-        } else {
-            auto wt=mkt(font,"Click an enemy on the right",13,C_DIM); wt.setPosition(34.f,240.f); win.draw(wt);
-            auto bk=mkt(font,"ESC to go back",11,C_DIM); bk.setPosition(34.f,264.f); win.draw(bk);
-        }
-
-        /* right panel: enemies */
-        draw_box(win,390.f,214.f,UI_W-410.f,UI_H-224.f,C_PANEL,C_BORDER);
-        draw_corners(win,390.f,214.f,UI_W-410.f,UI_H-224.f);
-        {const char* esec=state==St::ENEMY?"CLICK TO SELECT TARGET":"ENEMIES";
-         sf::Color ec=state==St::ENEMY?C_RED:C_DIM;
-         auto el=mkt(font,esec,11,ec,state==St::ENEMY); el.setPosition(404.f,220.f); win.draw(el);}
-        {float ey2=238.f; int ebi=0;
-         for(int i=np;i<nte;i++){
-             const Entity& en=ents[i]; float eh=EB_H;
-             bool hov=state==St::ENEMY&&ebi<(int)ebtns.size()&&ebtns[ebi].b.contains(ms);
-             if(state==St::ENEMY&&ebi<(int)ebtns.size()) ebtns[ebi].b={EB_X,ey2,EB_W,eh};
-             sf::Color fill=hov?C_SELECT:C_PANEL, bord=hov?C_RED:C_BORDER;
-             draw_box(win,EB_X,ey2,EB_W,eh,fill,bord,hov?2.f:1.5f);
-             std::string ename=en.name; if(!en.alive)ename+=" [DEAD]"; else if(en.stunned)ename+=" [STUN]";
-             auto nt=mkt(font,ename,13,en.alive?C_WHITE:sf::Color{80,50,50}); nt.setPosition(EB_X+8.f,ey2+4.f); win.draw(nt);
-             if(en.alive){
-                 draw_bar(win,EB_X+8.f,ey2+22.f,110.f,6.f,(float)en.hp,(float)en.max_hp,C_HP_E);
-                 std::ostringstream hs; hs<<en.hp<<"/"<<en.max_hp;
-                 auto hv2=mkt(font,hs.str(),10,C_DIM); hv2.setPosition(EB_X+124.f,ey2+18.f); win.draw(hv2);
-                 draw_bar(win,EB_X+200.f,ey2+22.f,80.f,6.f,en.stamina,(float)en.max_stamina,C_STAMINA);
-                 std::ostringstream ss3; ss3<<"ST "<<(int)en.stamina;
-                 auto sv3=mkt(font,ss3.str(),10,C_DIM); sv3.setPosition(EB_X+286.f,ey2+18.f); win.draw(sv3);}
-             ey2+=eh+EB_G; if(en.alive) ebi++;
-         }}
-
-        if(!status.empty()){
-            float pulse=0.5f+0.5f*std::sin(t*4.f);
-            sf::Uint8 al=static_cast<sf::Uint8>(180+int(pulse*75));
-            auto sm=mkt(font,status,14,{60,200,255,al},true);
-            draw_centered(win,sm,UI_W/2.f,UI_H-20.f);}
-
-        draw_scanlines(win);
+        /* ── Bottom hint ── */
+        Tcx(win, T(font,"P = menu / quit",11,sf::Color{50,60,80}), WW/2.f, WH-22.f);
+        Scanlines(win);
         win.display();
     }
 
-    result={ActionType::SKIP,-1,-1,WPN_NONE};
-    win.setTitle("Chrono Rift - Player HUD");
-    return result;
-}
+    /* ── draw_picking: full action picker ── */
+    void draw_picking(sf::RenderWindow& win){
+        win.clear(BG);
+        Grid(win);
 
-/* ════════════════════════════════════════════════════════════════════
+        /* refresh snapshot */
+        sem_wait(&gs->state_mutex);
+        memcpy(ents, gs->entities, sizeof(ents));
+        sem_post(&gs->state_mutex);
+
+        sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
+
+        /* title bar */
+        {
+            float p=0.5f+0.5f*sinf(clock_t*2.f);
+            sf::RectangleShape glow({(float)WW,52.f});
+            glow.setFillColor({10,20,60,(sf::Uint8)(20+(int)(p*15))});
+            win.draw(glow);
+            auto ti=T(font,std::string(me.name)+"'s Turn",22,GOLD,true);
+            ti.setPosition(20.f,10.f); win.draw(ti);
+            const char* ph=
+                step==Step::ACTION?"Choose Action":
+                step==Step::ENEMY ?"Choose Target":
+                step==Step::WEAPON?"Choose Weapon":"Choose from Storage";
+            auto pt=T(font,ph,14,ACCENT);
+            sf::FloatRect pb=pt.getLocalBounds();
+            pt.setPosition(WW-pb.width-20.f,16.f); win.draw(pt);
+            /* P key hint */
+            auto ph2=T(font,"P = menu",11,sf::Color{60,70,90});
+            sf::FloatRect pb2=ph2.getLocalBounds();
+            ph2.setPosition(WW-pb2.width-20.f, 36.f); win.draw(ph2);
+            sf::RectangleShape rule({(float)WW-40.f,1.f});
+            rule.setPosition(20.f,50.f); rule.setFillColor(BDR); win.draw(rule);
+        }
+
+        /* stats panel */
+        Box(win,20.f,58.f,WW-40.f,148.f,PANEL,BDR);
+        Corners(win,20.f,58.f,WW-40.f,148.f);
+        {
+            auto nm=T(font,me.name,16,WHITE,true); nm.setPosition(34.f,66.f); win.draw(nm);
+            std::ostringstream hs,ss;
+            hs<<me.hp<<"/"<<me.max_hp; ss<<(int)me.stamina<<"/"<<me.max_stamina;
+            auto hl=T(font,"HP",11,DIM); hl.setPosition(34.f,90.f); win.draw(hl);
+            Bar(win,60.f,92.f,280.f,14.f,(float)me.hp,(float)me.max_hp,HP_P);
+            auto hv=T(font,hs.str(),11,WHITE); hv.setPosition(348.f,90.f); win.draw(hv);
+            auto sl=T(font,"ST",11,DIM); sl.setPosition(34.f,114.f); win.draw(sl);
+            Bar(win,60.f,116.f,280.f,14.f,me.stamina,(float)me.max_stamina,STAM);
+            auto sv=T(font,ss.str(),11,WHITE); sv.setPosition(348.f,114.f); win.draw(sv);
+            std::ostringstream ds;
+            ds<<"DMG: "<<me.damage<<"   SPD: "<<me.speed;
+            auto dv=T(font,ds.str(),13,DIM); dv.setPosition(34.f,138.f); win.draw(dv);
+            /* inventory */
+            float ix=450.f,iy=68.f;
+            auto il=T(font,"INVENTORY",11,DIM); il.setPosition(ix,iy); win.draw(il); iy+=16.f;
+            bool vis[INVENTORY_SLOTS]={},any=false;
+            for(int s=0;s<INVENTORY_SLOTS;s++){
+                if(vis[s]) continue;
+                WeaponID w=me.inventory.slots[s]; if(w==WPN_NONE) continue;
+                if(inv_first_slot_of(me.inventory,s)!=s) continue;
+                std::ostringstream ws; ws<<"["<<s<<"] "<<weapon_def(w).name;
+                auto wt=T(font,ws.str(),12,ACCENT); wt.setPosition(ix,iy); win.draw(wt);
+                iy+=15.f; any=true;
+                for(int k=s;k<INVENTORY_SLOTS&&me.inventory.slots[k]==w;k++) vis[k]=true;}
+            if(!any){auto et=T(font,"(empty)",12,DIM); et.setPosition(ix,iy); win.draw(et);}
+            if(can_ult){auto ut=T(font,"*** ULTIMATE AVAILABLE ***",13,ULT,true);
+                ut.setPosition(34.f,158.f); win.draw(ut);}
+        }
+
+        /* left panel */
+        Box(win,20.f,214.f,375.f,WH-224.f,PANEL,BDR);
+        Corners(win,20.f,214.f,375.f,WH-224.f);
+
+        if(step==Step::ACTION){
+            auto lhdr=T(font,"ACTIONS",11,DIM); lhdr.setPosition(34.f,220.f); win.draw(lhdr);
+            for(auto& b:action_btns){
+                bool hov=b.b.contains(ms)&&b.enabled;
+                Box(win,b.b.left,b.b.top,b.b.width,b.b.height,
+                    hov?SEL:PANEL, hov?BDR_HI:b.enabled?BDR:sf::Color{25,28,50}, hov?2.f:1.5f);
+                if(b.enabled){
+                    sf::RectangleShape bar({3.f,b.b.height-8.f});
+                    bar.setPosition(b.b.left+4.f,b.b.top+4.f);
+                    bar.setFillColor(hov?b.acc:sf::Color{b.acc.r,b.acc.g,b.acc.b,80});
+                    win.draw(bar);}
+                sf::Color tc=!b.enabled?DIM:hov?WHITE:sf::Color{160,170,190};
+                auto lt=T(font,b.lbl,15,tc,hov); lt.setPosition(b.b.left+14.f,b.b.top+7.f); win.draw(lt);
+                if(!b.sub.empty()){
+                    auto st=T(font,b.sub,11,hov?ACCENT:DIM);
+                    st.setPosition(b.b.left+14.f,b.b.top+b.b.height-18.f); win.draw(st);}
+            }
+        } else if(step==Step::WEAPON){
+            auto lhdr=T(font,"SELECT WEAPON  (ESC=back)",11,ACCENT);
+            lhdr.setPosition(34.f,220.f); win.draw(lhdr);
+            for(auto& wb:wpn_btns){
+                bool hov=wb.b.contains(ms);
+                Box(win,wb.b.left,wb.b.top,wb.b.width,wb.b.height,
+                    hov?SEL:PANEL,hov?BDR_HI:BDR,hov?2.f:1.5f);
+                std::ostringstream ws;
+                ws<<"["<<wb.slot<<"] "<<weapon_def(wb.wid).name<<"  dmg "<<weapon_def(wb.wid).damage;
+                auto wt=T(font,ws.str(),14,hov?WHITE:DIM);
+                wt.setPosition(wb.b.left+8.f,wb.b.top+12.f); win.draw(wt);}
+        } else if(step==Step::LTS){
+            auto lhdr=T(font,"LONG-TERM STORAGE  (ESC=back)",11,PURPLE);
+            lhdr.setPosition(34.f,220.f); win.draw(lhdr);
+            for(auto& lb:lts_btns){
+                bool hov=lb.b.contains(ms);
+                Box(win,lb.b.left,lb.b.top,lb.b.width,lb.b.height,
+                    hov?SEL:PANEL,hov?BDR_HI:BDR,hov?2.f:1.5f);
+                auto lt=T(font,weapon_def(lb.wid).name,14,hov?WHITE:DIM);
+                lt.setPosition(lb.b.left+8.f,lb.b.top+12.f); win.draw(lt);}
+        } else {
+            auto lhdr=T(font,"CLICK ENEMY ON RIGHT  (ESC=back)",11,RED);
+            lhdr.setPosition(34.f,220.f); win.draw(lhdr);
+            auto arr=T(font,">>>",22,RED,true); arr.setPosition(34.f,260.f); win.draw(arr);
+            if(sel_act>=0){
+                auto ab=T(font,"Action: "+action_btns[sel_act].lbl,13,ACCENT);
+                ab.setPosition(34.f,300.f); win.draw(ab);}
+        }
+
+        /* right panel: enemies */
+        Box(win,400.f,214.f,WW-420.f,WH-224.f,PANEL,BDR);
+        Corners(win,400.f,214.f,WW-420.f,WH-224.f);
+        {
+            sf::Color ec=step==Step::ENEMY?RED:DIM;
+            auto eh=T(font,step==Step::ENEMY?"CLICK TO SELECT TARGET":"ENEMIES",11,ec,step==Step::ENEMY);
+            eh.setPosition(414.f,220.f); win.draw(eh);
+        }
+        float ey=238.f;
+        for(int i=np;i<nte;i++){
+            const Entity& en=ents[i];
+            bool clickable=step==Step::ENEMY&&en.alive;
+            bool hov=false;
+            for(auto& eb:enemy_btns) if(eb.idx==i){
+                eb.b={400.f,ey,WW-420.f,38.f};
+                hov=clickable&&eb.b.contains(ms); break;}
+            Box(win,400.f,ey,WW-420.f,38.f,
+                hov?SEL:PANEL, hov?RED:BDR, hov?2.f:1.5f);
+            std::string nm=en.name;
+            if(!en.alive) nm+=" [DEAD]"; else if(en.stunned) nm+=" [STUN]";
+            auto nt=T(font,nm,13,en.alive?WHITE:sf::Color{80,50,50});
+            nt.setPosition(408.f,ey+4.f); win.draw(nt);
+            if(en.alive){
+                Bar(win,408.f,ey+22.f,110.f,7.f,(float)en.hp,(float)en.max_hp,HP_E);
+                std::ostringstream hs; hs<<en.hp<<"/"<<en.max_hp;
+                auto hv=T(font,hs.str(),10,DIM); hv.setPosition(524.f,ey+20.f); win.draw(hv);
+                Bar(win,570.f,ey+22.f,80.f,7.f,en.stamina,(float)en.max_stamina,STAM);
+                std::ostringstream ss; ss<<"ST "<<(int)en.stamina;
+                auto sv=T(font,ss.str(),10,DIM); sv.setPosition(656.f,ey+20.f); win.draw(sv);}
+            ey+=44.f;
+        }
+
+        /* status hint at bottom */
+        if(!status.empty()){
+            float p=0.5f+0.5f*sinf(clock_t*4.f);
+            auto sm=T(font,status,14,{60,200,255,(sf::Uint8)(180+(int)(p*75))},true);
+            Tcx(win,sm,WW/2.f,WH-22.f);}
+
+        Scanlines(win);
+        win.display();
+    }
+};
+
+/* ═══════════════════════════════════════════════════════════════════
  * Player thread
- * Posts a UI request to main thread, waits for result.
- * ════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════ */
 struct PlayerArg { int pidx; };
 
 static void* player_thread(void* arg_)
 {
-    PlayerArg* arg=static_cast<PlayerArg*>(arg_);
-    int pidx=arg->pidx; delete arg;
-
+    PlayerArg* a=static_cast<PlayerArg*>(arg_); int pidx=a->pidx; delete a;
     gs->entities[pidx].pid=getpid();
 
     while(!g_quit){
         sem_wait(&player_sem[pidx]);
         if(g_quit) break;
-
         if(gs->current_turn!=pidx||!gs->turn_ready||!gs->entities[pidx].alive) continue;
 
-        /* Stunned: auto-skip */
         if(gs->entities[pidx].stunned||g_stunned){
             Action act{ActionType::SKIP,-1,-1,WPN_NONE};
             sem_wait(&gs->state_mutex);
@@ -548,34 +637,31 @@ static void* player_thread(void* arg_)
             continue;
         }
 
-        /* Request UI from main thread */
-        pthread_mutex_lock(&g_ui_mutex);
-        g_ui_req={pidx,true};
-        pthread_mutex_unlock(&g_ui_mutex);
-        sem_post(&g_ui_request_sem);     /* wake main thread */
-        sem_wait(&g_ui_done_sem);        /* wait for result  */
+        pthread_mutex_lock(&g_ui_mtx);
+        g_ui_pidx=pidx;
+        pthread_mutex_unlock(&g_ui_mtx);
+        sem_post(&g_ui_req_sem);
+        sem_wait(&g_ui_done_sem);
 
         Action act=g_ui_result;
-
         sem_wait(&gs->state_mutex);
         gs->entities[pidx].pending_action=act;
         gs->entities[pidx].action_ready=true;
         sem_post(&gs->state_mutex);
         sem_post(&gs->action_sem);
-
-        while(!g_quit&&!gs->entities[pidx].action_done) usleep(10000);
+        /* Action submitted — return immediately, no waiting screen */
+        /* The UI main thread will switch to WAIT mode on its own */
     }
     return nullptr;
 }
 
-/* ════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════
  * Dispatcher thread
- * ════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════ */
 static void* dispatcher(void*)
 {
     while(!g_quit){
-        sem_wait(&gs->hip_turn_sem);
-        if(g_quit) break;
+        sem_wait(&gs->hip_turn_sem); if(g_quit) break;
         int ct=gs->current_turn;
         if(ct>=0&&ct<gs->num_players&&gs->entities[ct].alive)
             sem_post(&player_sem[ct]);
@@ -583,219 +669,229 @@ static void* dispatcher(void*)
     return nullptr;
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * main  —  owns the SFML event loop
- * ════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════
+ * main
+ * ═══════════════════════════════════════════════════════════════════ */
 int main(int argc, char* argv[])
 {
     if(argc<3){fprintf(stderr,"Usage: hip <roll_no> <num_players>\n");return 1;}
     g_num_players=atoi(argv[2]);
-
     gs=shm_open_existing();
 
     struct sigaction sa{};
     sa.sa_handler=sig_term; sigaction(SIGTERM,&sa,nullptr);
     sa.sa_handler=sig_stun; sigaction(SIGUSR1,&sa,nullptr);
 
-    /* Load font on main thread */
-    sf::Font font;
-    for(int i=0;FONT_PATHS[i];++i) if(font.loadFromFile(FONT_PATHS[i])) break;
-
-    /* Init semaphores */
-    sem_init(&g_ui_request_sem,0,0);
-    sem_init(&g_ui_done_sem,   0,0);
+    sem_init(&g_ui_req_sem, 0,0);
+    sem_init(&g_ui_done_sem,0,0);
     for(int i=0;i<g_num_players;i++) sem_init(&player_sem[i],0,0);
 
-    /* Spawn dispatcher + player threads */
+    /* ONE persistent window — created here, never recreated */
+    sf::RenderWindow win(sf::VideoMode(WW,WH),
+                         "Chrono Rift - Player Actions",
+                         sf::Style::Titlebar|sf::Style::Close);
+    win.setFramerateLimit(60);
+    win.setVerticalSyncEnabled(false);
+
+    HipUI ui;
+    ui.load_font();
+
     pthread_t disp_tid;
     pthread_create(&disp_tid,nullptr,dispatcher,nullptr);
-
     pthread_t ptids[MAX_PLAYERS];
     for(int i=0;i<g_num_players;i++){
         auto* a=new PlayerArg{i};
-        pthread_create(&ptids[i],nullptr,player_thread,a);
-    }
+        pthread_create(&ptids[i],nullptr,player_thread,a);}
 
-    /* ── ONE persistent window for entire game lifetime (WSL2 safe) ── */
-    sf::RenderWindow main_win(sf::VideoMode(UI_W, UI_H),
-                              "Chrono Rift - Player HUD",
-                              sf::Style::Titlebar | sf::Style::Close);
-    main_win.setFramerateLimit(60);
-    main_win.setVerticalSyncEnabled(false);
+    sf::Clock clk;
 
-    /* ── Main thread: serve UI requests until game over ── */
-    while(!g_quit&&gs->phase!=GamePhase::GAME_OVER){
+    /* ── Main event loop ── */
+    while(!g_quit && gs->phase!=GamePhase::GAME_OVER && win.isOpen()){
+        ui.clock_t=clk.getElapsedTime().asSeconds();
 
-        /* ── Handle window close ── */
-        sf::Event idle_ev{};
-        while(main_win.pollEvent(idle_ev)){
-            if(idle_ev.type==sf::Event::Closed){
-                g_quit=1; kill(gs->arbiter_pid,SIGTERM);
-            }
-        }
-
-        /* ── Draw idle "waiting" screen ── */
-        {
-            /* Snapshot for idle display */
-            sem_wait(&gs->state_mutex);
-            Entity snap_ents[MAX_ENTITIES];
-            memcpy(snap_ents, gs->entities, sizeof(snap_ents));
-            int snap_np=gs->num_players, snap_nte=gs->total_entities;
-            int snap_ct=gs->current_turn, snap_kills=gs->enemies_killed;
-            sem_post(&gs->state_mutex);
-
-            main_win.clear(sf::Color{8,10,20});
-            /* Grid */
-            {sf::RectangleShape gl({(float)UI_W,1.f}); gl.setFillColor({20,30,60,30});
-             for(unsigned gy=0;gy<UI_H;gy+=32){gl.setPosition(0,(float)gy);main_win.draw(gl);}
-             gl.setSize({1.f,(float)UI_H});
-             for(unsigned gx=0;gx<UI_W;gx+=32){gl.setPosition((float)gx,0);main_win.draw(gl);}}
-            /* Title */
-            auto ti=mkt(font,"CHRONO RIFT - Player HUD",20,C_GOLD,true);
-            ti.setPosition(20.f,12.f); main_win.draw(ti);
-            std::ostringstream ks; ks<<"Kills: "<<snap_kills<<" / 10";
-            auto kt=mkt(font,ks.str(),14,C_DIM); kt.setPosition((float)UI_W-150.f,16.f); main_win.draw(kt);
-            sf::RectangleShape rule({(float)UI_W-40.f,1.f}); rule.setPosition(20.f,42.f); rule.setFillColor(C_BORDER); main_win.draw(rule);
-            /* Entity list */
-            float ey=54.f;
-            auto ph=mkt(font,"PLAYERS",11,C_GREEN); ph.setPosition(24.f,ey); main_win.draw(ph); ey+=16.f;
-            for(int i=0;i<snap_np;i++){
-                const Entity& e=snap_ents[i];
-                bool active=(snap_ct==i);
-                std::string nm=(active?">>> ":"    ")+std::string(e.name)+(e.alive?(e.stunned?" [STUN]":""):" [DEAD]");
-                auto nt=mkt(font,nm,13,active?C_GOLD:e.alive?C_WHITE:sf::Color{80,50,50},active);
-                nt.setPosition(24.f,ey); main_win.draw(nt);
-                if(e.alive){
-                    float bx=200.f;
-                    sf::RectangleShape bg({180.f,8.f}); bg.setPosition(bx,ey+4.f); bg.setFillColor({30,30,50}); main_win.draw(bg);
-                    float r=(float)e.hp/(float)e.max_hp; if(r<0)r=0; if(r>1)r=1;
-                    sf::RectangleShape bar({180.f*r,8.f}); bar.setPosition(bx,ey+4.f); bar.setFillColor(C_HP_P); main_win.draw(bar);
-                    std::ostringstream hs; hs<<e.hp<<"/"<<e.max_hp;
-                    auto hv=mkt(font,hs.str(),10,C_DIM); hv.setPosition(bx+184.f,ey+2.f); main_win.draw(hv);
-                }
-                ey+=18.f;
-            }
-            ey+=6.f;
-            auto eh=mkt(font,"ENEMIES",11,C_RED); eh.setPosition(24.f,ey); main_win.draw(eh); ey+=16.f;
-            for(int i=snap_np;i<snap_nte;i++){
-                const Entity& e=snap_ents[i]; if(!e.alive) continue;
-                bool active=(snap_ct==i);
-                std::string nm=(active?">>> ":"    ")+std::string(e.name)+(e.stunned?" [STUN]":"");
-                auto nt=mkt(font,nm,13,active?C_GOLD:C_WHITE,active); nt.setPosition(24.f,ey); main_win.draw(nt);
-                float bx=200.f;
-                sf::RectangleShape bg({180.f,8.f}); bg.setPosition(bx,ey+4.f); bg.setFillColor({30,30,50}); main_win.draw(bg);
-                float r=(float)e.hp/(float)e.max_hp; if(r<0)r=0; if(r>1)r=1;
-                sf::RectangleShape bar({180.f*r,8.f}); bar.setPosition(bx,ey+4.f); bar.setFillColor(C_HP_E); main_win.draw(bar);
-                std::ostringstream hs; hs<<e.hp<<"/"<<e.max_hp;
-                auto hv=mkt(font,hs.str(),10,C_DIM); hv.setPosition(bx+184.f,ey+2.f); main_win.draw(hv);
-                ey+=18.f;
-            }
-            /* Action log */
-            sem_wait(&gs->log_mutex);
-            float ly=(float)UI_H-120.f;
-            sf::RectangleShape logbg({(float)UI_W-40.f,110.f}); logbg.setPosition(20.f,ly); logbg.setFillColor({12,14,28}); logbg.setOutlineColor(C_BORDER); logbg.setOutlineThickness(1.f); main_win.draw(logbg);
-            auto lh=mkt(font,"LOG",11,C_DIM); lh.setPosition(26.f,ly+4.f); main_win.draw(lh);
-            float lty=ly+18.f;
-            for(int l=0;l<5;l++){
-                int idx=(gs->log_head-5+l+LOG_LINES)%LOG_LINES;
-                if(gs->log[idx][0]=='\0') continue;
-                auto lt=mkt(font,gs->log[idx],11,C_DIM); lt.setPosition(26.f,lty); main_win.draw(lt); lty+=18.f;
-            }
-            sem_post(&gs->log_mutex);
-            main_win.display();
-        }
-
-        /* ── Check for pending weapon drop (arbiter waiting for player response) ── */
-        if(gs->pending_drop_ready && !gs->pending_drop_done) {
-            int drop_pidx = gs->pending_drop_for;
-            WeaponID wpn  = gs->pending_drop_wpn;
+        /* ── Weapon drop check ───────────────────────────────────────
+         * Arbiter sets pending_drop_ready when an enemy dies and drops
+         * a weapon. We show a YES/NO window, then set drop_done. */
+        if (gs->pending_drop_ready && !gs->pending_drop_done) {
+            WeaponID dwpn = gs->pending_drop_wpn;
+            int dfor      = gs->pending_drop_for;
             bool taken    = false;
 
-            if(drop_pidx >= 0 && drop_pidx < g_num_players) {
-                /* Show YES/NO overlay on the persistent window */
-                const Entity& me = gs->entities[drop_pidx];
-                std::string wname = weapon_def(wpn).name;
-                sf::FloatRect yes_b={80.f,380.f,180.f,52.f}, no_b={300.f,380.f,180.f,52.f};
-                bool decided=false;
-
-                while(!decided && !g_quit && main_win.isOpen()){
-                    sf::Vector2f ms=main_win.mapPixelToCoords(sf::Mouse::getPosition(main_win));
-                    sf::Event ev{};
-                    while(main_win.pollEvent(ev)){
-                        if(ev.type==sf::Event::Closed){g_quit=1;decided=true;}
-                        if(ev.type==sf::Event::KeyPressed){
-                            if(ev.key.code==sf::Keyboard::Y){taken=true;decided=true;}
-                            if(ev.key.code==sf::Keyboard::N){taken=false;decided=true;}
-                            if(ev.key.code==sf::Keyboard::Return){taken=true;decided=true;}
-                            if(ev.key.code==sf::Keyboard::Escape){taken=false;decided=true;}
+            if (dfor >= 0 && dfor < g_num_players) {
+                /* Show YES/NO drop window */
+                sf::RenderWindow dwin(
+                    sf::VideoMode(480, 240), "Weapon Drop!",
+                    sf::Style::Titlebar | sf::Style::Close);
+                dwin.setFramerateLimit(60);
+                sf::FloatRect yes_b={60.f,162.f,150.f,44.f};
+                sf::FloatRect no_b ={270.f,162.f,150.f,44.f};
+                while (dwin.isOpen()) {
+                    sf::Vector2f ms=dwin.mapPixelToCoords(sf::Mouse::getPosition(dwin));
+                    sf::Event dev{};
+                    while(dwin.pollEvent(dev)) {
+                        if(dev.type==sf::Event::Closed){dwin.close();break;}
+                        if(dev.type==sf::Event::KeyPressed) {
+                            if(dev.key.code==sf::Keyboard::Y||dev.key.code==sf::Keyboard::Return)
+                                {taken=true; dwin.close();}
+                            if(dev.key.code==sf::Keyboard::N||dev.key.code==sf::Keyboard::Escape)
+                                {taken=false; dwin.close();}
                         }
-                        if(ev.type==sf::Event::MouseButtonPressed&&ev.mouseButton.button==sf::Mouse::Left){
-                            sf::Vector2f msc=main_win.mapPixelToCoords({ev.mouseButton.x,ev.mouseButton.y});
-                            if(yes_b.contains(msc)){taken=true;decided=true;}
-                            if(no_b.contains(msc)){taken=false;decided=true;}
+                        if(dev.type==sf::Event::MouseButtonPressed&&
+                           dev.mouseButton.button==sf::Mouse::Left) {
+                            if(yes_b.contains(ms)){taken=true; dwin.close();}
+                            if(no_b.contains(ms)) {taken=false;dwin.close();}
                         }
                     }
-                    /* Draw drop prompt overlay */
-                    main_win.clear(sf::Color{8,10,20});
-                    /* Dark overlay panel */
-                    sf::RectangleShape panel({560.f,240.f}); panel.setPosition(20.f,200.f);
-                    panel.setFillColor({16,18,38}); panel.setOutlineColor(C_BORDER); panel.setOutlineThickness(2.f); main_win.draw(panel);
-                    auto ttl=mkt(font,"WEAPON DROP!",26,C_GOLD,true); draw_centered(main_win,ttl,300.f,215.f);
-                    sf::RectangleShape rl({520.f,1.f}); rl.setPosition(40.f,252.f); rl.setFillColor(C_BORDER); main_win.draw(rl);
-                    std::string info=wname+" (dmg "+std::to_string(weapon_def(wpn).damage)+", "+std::to_string(weapon_def(wpn).slots)+" slots)";
-                    auto wt=mkt(font,info,17,C_ACCENT); draw_centered(main_win,wt,300.f,262.f);
-                    std::string q=std::string(me.name)+", pick it up?";
-                    auto qt=mkt(font,q,14,C_WHITE); draw_centered(main_win,qt,300.f,294.f);
-                    auto hnt=mkt(font,"Y/Enter=Yes    N/Esc=No",12,C_DIM); draw_centered(main_win,hnt,300.f,318.f);
-                    bool yh=yes_b.contains(ms),nh=no_b.contains(ms);
-                    draw_box(main_win,yes_b.left,yes_b.top,yes_b.width,yes_b.height,yh?sf::Color{10,60,20}:sf::Color{16,18,38},yh?C_GREEN:C_BORDER,yh?2.f:1.5f);
-                    auto yt=mkt(font,"YES  (Y)",18,yh?C_GREEN:C_DIM,yh); draw_centered(main_win,yt,yes_b.left+yes_b.width/2.f,yes_b.top+14.f);
-                    draw_box(main_win,no_b.left,no_b.top,no_b.width,no_b.height,nh?sf::Color{60,10,10}:sf::Color{16,18,38},nh?C_RED:C_BORDER,nh?2.f:1.5f);
-                    auto nt2=mkt(font,"NO   (N)",18,nh?C_RED:C_DIM,nh); draw_centered(main_win,nt2,no_b.left+no_b.width/2.f,no_b.top+14.f);
-                    main_win.display();
+                    if (!dwin.isOpen()) break;
+                    dwin.clear(sf::Color{8,10,20});
+                    /* Title */
+                    auto ttl=T(ui.font,"WEAPON DROP!",22,sf::Color{220,185,80},true);
+                    sf::FloatRect tb=ttl.getLocalBounds();
+                    ttl.setOrigin(tb.left+tb.width/2.f,tb.top);
+                    ttl.setPosition(240.f,14.f); dwin.draw(ttl);
+                    /* Weapon info */
+                    char wbuf[64];
+                    snprintf(wbuf,sizeof(wbuf),"%s  dmg=%d  slots=%d",
+                        weapon_def(dwpn).name,weapon_def(dwpn).damage,weapon_def(dwpn).slots);
+                    auto wt=T(ui.font,wbuf,16,sf::Color{60,200,255});
+                    sf::FloatRect wb2=wt.getLocalBounds();
+                    wt.setOrigin(wb2.left+wb2.width/2.f,wb2.top);
+                    wt.setPosition(240.f,56.f); dwin.draw(wt);
+                    char qbuf[64];
+                    snprintf(qbuf,sizeof(qbuf),"%s: pick it up?",
+                        gs->entities[dfor].name);
+                    auto qt=T(ui.font,qbuf,14,sf::Color{200,210,220});
+                    sf::FloatRect qb=qt.getLocalBounds();
+                    qt.setOrigin(qb.left+qb.width/2.f,qb.top);
+                    qt.setPosition(240.f,86.f); dwin.draw(qt);
+                    auto hint=T(ui.font,"Y / Enter = Yes     N / Esc = No",11,sf::Color{80,90,110});
+                    sf::FloatRect hb=hint.getLocalBounds();
+                    hint.setOrigin(hb.left+hb.width/2.f,hb.top);
+                    hint.setPosition(240.f,112.f); dwin.draw(hint);
+                    /* YES button */
+                    bool yh=yes_b.contains(ms);
+                    sf::RectangleShape ybox({yes_b.width,yes_b.height});
+                    ybox.setPosition(yes_b.left,yes_b.top);
+                    ybox.setFillColor(yh?sf::Color{10,50,20}:sf::Color{16,18,35});
+                    ybox.setOutlineColor(yh?sf::Color{60,220,120}:sf::Color{40,80,60});
+                    ybox.setOutlineThickness(1.5f); dwin.draw(ybox);
+                    auto yt=T(ui.font,"YES (Y)",16,yh?sf::Color{60,220,120}:sf::Color{80,100,80},yh);
+                    sf::FloatRect ytb=yt.getLocalBounds();
+                    yt.setOrigin(ytb.left+ytb.width/2.f,ytb.top);
+                    yt.setPosition(yes_b.left+yes_b.width/2.f,yes_b.top+12.f); dwin.draw(yt);
+                    /* NO button */
+                    bool nh=no_b.contains(ms);
+                    sf::RectangleShape nbox({no_b.width,no_b.height});
+                    nbox.setPosition(no_b.left,no_b.top);
+                    nbox.setFillColor(nh?sf::Color{50,10,10}:sf::Color{16,18,35});
+                    nbox.setOutlineColor(nh?sf::Color{220,60,60}:sf::Color{80,40,40});
+                    nbox.setOutlineThickness(1.5f); dwin.draw(nbox);
+                    auto nt2=T(ui.font,"NO  (N)",16,nh?sf::Color{220,60,60}:sf::Color{100,60,60},nh);
+                    sf::FloatRect ntb=nt2.getLocalBounds();
+                    nt2.setOrigin(ntb.left+ntb.width/2.f,ntb.top);
+                    nt2.setPosition(no_b.left+no_b.width/2.f,no_b.top+12.f); dwin.draw(nt2);
+                    dwin.display();
                 }
             }
+            /* Tell arbiter the player's decision */
             sem_wait(&gs->state_mutex);
             gs->pending_drop_taken = taken;
             gs->pending_drop_done  = true;
             sem_post(&gs->state_mutex);
         }
 
-        /* ── Non-blocking check for UI action request ── */
-        struct timespec ts{}; clock_gettime(CLOCK_REALTIME,&ts);
-        ts.tv_nsec+=16000000LL; /* ~16ms poll */
+        /* Poll for a UI action request (~16ms timeout) */
+        struct timespec ts{};
+        clock_gettime(CLOCK_REALTIME,&ts);
+        ts.tv_nsec+=16000000LL;
         if(ts.tv_nsec>=1000000000LL){ts.tv_sec++;ts.tv_nsec-=1000000000LL;}
 
-        if(sem_timedwait(&g_ui_request_sem,&ts)==0){
-            pthread_mutex_lock(&g_ui_mutex);
-            int pidx=g_ui_req.pidx;
-            g_ui_req.pending=false;
-            pthread_mutex_unlock(&g_ui_mutex);
+        bool got_req=(sem_timedwait(&g_ui_req_sem,&ts)==0);
 
-            if(pidx>=0&&pidx<g_num_players&&!g_quit){
-                g_ui_result=show_action_window(pidx,font,main_win);
+        if(got_req){
+            pthread_mutex_lock(&g_ui_mtx);
+            int pidx=g_ui_pidx; g_ui_pidx=-1;
+            pthread_mutex_unlock(&g_ui_mtx);
+
+            if(pidx>=0&&pidx<g_num_players){
+                ui.begin_turn(pidx);
+
+                /* Inner loop: stay in PICKING mode until action confirmed */
+                Action result{}; bool done=false;
+                while(!done&&!g_quit&&win.isOpen()){
+                    ui.clock_t=clk.getElapsedTime().asSeconds();
+                    sf::Event ev{};
+                    while(win.pollEvent(ev)){
+                        if(ev.type==sf::Event::Closed){ g_quit=1; break; }
+                        if(ev.type==sf::Event::KeyPressed){
+                            if(ev.key.code==sf::Keyboard::Escape) ui.handle_esc();
+                            if(ev.key.code==sf::Keyboard::P){
+                                /* Open pause menu — blocks until dismissed */
+                                bool quit_chosen=draw_pause_menu(win,ui.font);
+                                if(quit_chosen){ done=true; result={ActionType::SKIP,-1,-1,WPN_NONE}; }
+                            }
+                        }
+                        if(ev.type==sf::Event::MouseButtonPressed&&
+                           ev.mouseButton.button==sf::Mouse::Left){
+                            sf::Vector2f ms=win.mapPixelToCoords({ev.mouseButton.x,ev.mouseButton.y});
+                            if(ui.handle_click(ms,result)) done=true;
+                        }
+                    }
+                    if(!done) ui.draw_picking(win);
+                }
+                if(g_quit) result={ActionType::SKIP,-1,-1,WPN_NONE};
+                g_ui_result=result;
+                ui.mode=UIMode::WAIT;
             } else {
                 g_ui_result={ActionType::SKIP,-1,-1,WPN_NONE};
+                ui.mode=UIMode::WAIT;
             }
             sem_post(&g_ui_done_sem);
         }
+
+        /* Outer loop: events + draw the wait screen */
+        sf::Event ev{};
+        while(win.pollEvent(ev)){
+            if(ev.type==sf::Event::Closed){ g_quit=1; kill(gs->arbiter_pid,SIGTERM); }
+            if(ev.type==sf::Event::KeyPressed && ev.key.code==sf::Keyboard::P){
+                draw_pause_menu(win,ui.font);
+            }
+        }
+        /* Only draw the wait screen when not in picking mode */
+        if(ui.mode==UIMode::WAIT)
+            ui.draw_wait(win);
+    }
+
+    /* Game over screen */
+    if(win.isOpen()&&gs->phase==GamePhase::GAME_OVER){
+        for(int f=0;f<90&&win.isOpen();f++){
+            sf::Event ev{};
+            while(win.pollEvent(ev)) if(ev.type==sf::Event::Closed) break;
+            win.clear(BG);
+            Grid(win);
+            const char* msg=gs->result==GameResult::WIN?"VICTORY!":
+                            gs->result==GameResult::LOSE?"DEFEAT!":"QUIT";
+            sf::Color mc=gs->result==GameResult::WIN?GREEN:RED;
+            auto mt=T(ui.font,msg,64,mc,true); Tcx(win,mt,WW/2.f,WH/2.f-50.f);
+            auto sub=T(ui.font,"Window closing...",16,DIM); Tcx(win,sub,WW/2.f,WH/2.f+30.f);
+            Scanlines(win);
+            win.display();
+        }
+        win.close();
     }
 
     /* Shutdown */
     g_quit=1;
-    /* Unblock anything waiting */
     for(int i=0;i<g_num_players;i++) sem_post(&player_sem[i]);
     sem_post(&gs->hip_turn_sem);
-    sem_post(&g_ui_request_sem);
+    sem_post(&g_ui_req_sem);
     sem_post(&g_ui_done_sem);
 
     pthread_join(disp_tid,nullptr);
     for(int i=0;i<g_num_players;i++) pthread_join(ptids[i],nullptr);
-
     for(int i=0;i<g_num_players;i++) sem_destroy(&player_sem[i]);
-    sem_destroy(&g_ui_request_sem);
+    sem_destroy(&g_ui_req_sem);
     sem_destroy(&g_ui_done_sem);
-
     munmap(gs,sizeof(SharedState));
     return 0;
 }

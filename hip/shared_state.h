@@ -126,9 +126,7 @@ struct Entity {
     Action     pending_action;
     bool       action_ready = false;   /* set by hip/asp after writing action */
     bool       action_done  = false;   /* set by arbiter after consuming */
-
-    /* Swap-In cooldown: weapon swapped in this turn cannot be used until next turn */
-    int        swap_in_slot = -1;      /* slot of weapon just swapped in (-1 = none) */
+    int        swap_in_slot = -1;      /* inventory slot just swapped in (-1=none) */
 
     char       last_log[128] = {};
 };
@@ -139,9 +137,17 @@ enum class ArtifactState : int { FREE = 0, HELD };
 struct ArtifactEntry {
     WeaponID      weapon   = WPN_NONE;
     ArtifactState state    = ArtifactState::FREE;
-    int           held_by  = -1;
+    int           held_by  = -1;   /* entity index, or -1 if free */
     bool          exists   = false;
 };
+
+/*
+ * waiting_for[i] = weapon ID that entity i is currently blocked waiting to acquire.
+ * WPN_NONE means entity i is not waiting for any artifact.
+ * Written by the process that wants to acquire an artifact (HIP/ASP)
+ * before attempting to lock; cleared after acquisition or abort.
+ * Protected by artifact_mutex.
+ */
 
 /* ─── Game phase / result ────────────────────────────────────────── */
 enum class GamePhase  : int { INIT = 0, RUNNING, ULTIMATE_PAUSE, GAME_OVER };
@@ -163,17 +169,15 @@ struct SharedState {
     bool        turn_ready     = false;
     bool        npc_submitted  = false;
 
-    /* ── Lifecycle tracking queues (spec s2: Lifecycle Management) ──
-     * active_players / active_enemies track which entity indices are
-     * still alive. Arbiter updates these immediately when an entity dies.
-     * hip and asp can read them to know which channels are still open. */
-    int  active_players[MAX_PLAYERS];   /* entity indices of alive players */
-    int  num_active_players = 0;
-    int  active_enemies[MAX_ENEMIES];   /* entity indices of alive enemies */
-    int  num_active_enemies = 0;
-
-    /* Artifacts */
+    /* Artifacts — global resource table (spec s7) */
     ArtifactEntry artifacts[NUM_ARTIFACTS];
+
+    /*
+     * waiting_for[entity_idx]: which WeaponID that entity is blocked on.
+     * WPN_NONE = not waiting. Updated under artifact_mutex.
+     * Used by the deadlock monitor for circular-wait detection.
+     */
+    WeaponID      waiting_for[MAX_ENTITIES];
 
     /* Action log (ring buffer, 16 lines) */
     char        log[LOG_LINES][LOG_LINE_LEN];
@@ -187,21 +191,34 @@ struct SharedState {
     sem_t artifact_mutex;   /* protects artifact table                   */
     sem_t log_mutex;        /* protects log ring buffer                  */
 
+    /* render_ready: set by render thread once window is open.
+     * arbiter_main_loop waits on this before starting turns. */
+    volatile bool render_ready = false;
+
     /* Process PIDs for signal delivery */
     pid_t arbiter_pid   = 0;
     pid_t hip_pid       = 0;
     pid_t asp_pid       = 0;
 
-    /* Weapon drop: arbiter sets after enemy death,
-     * hip shows pickup prompt, then clears it */
-    WeaponID pending_drop_wpn   = WPN_NONE;
-    int      pending_drop_for   = -1;    // player entity idx offered the drop
-    bool     pending_drop_ready = false; // arbiter→hip: drop is waiting
-    bool     pending_drop_done  = false; // hip→arbiter: player responded
-    bool     pending_drop_taken = false; // hip→arbiter: player picked it up
-
     /* Roll number seed */
     unsigned seed = 0;
+
+    /* ── Weapon Drop IPC (spec s6) ── */
+    volatile bool   pending_drop_ready  = false; /* arbiter set: drop available  */
+    volatile bool   pending_drop_done   = false; /* hip set: player decided      */
+    volatile bool   pending_drop_taken  = false; /* hip set: player took it      */
+    WeaponID        pending_drop_wpn    = WPN_NONE;
+    int             pending_drop_for    = -1;    /* which player gets to choose  */
+
+    /* ── swap_in cooldown per entity ── */
+    /* swap_in_slot[i]: inventory slot that was just swapped in (can't use this turn).
+     * -1 = none pending.  Stored per entity in the Entity struct below. */
+
+    /* ── Lifecycle tracking queues (spec s2) ── */
+    int  active_players[MAX_PLAYERS];
+    int  num_active_players = 0;
+    int  active_enemies[MAX_ENEMIES];
+    int  num_active_enemies = 0;
 };
 
 /* ─── RNG (LCG seeded from roll number) ─────────────────────────── */

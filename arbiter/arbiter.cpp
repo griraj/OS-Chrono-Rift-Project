@@ -36,6 +36,7 @@
 #include <semaphore.h>
 #include <errno.h>
 #include <climits>
+#include <cmath>
 #include <string>
 #include <sstream>
 
@@ -68,7 +69,6 @@ static void sig_alrm(int)
 {
     g_ultimate = 0;
     if (g_asp_pid > 0) kill(g_asp_pid, SIGCONT);
-    // After Ultimate ends, next turn could be anyone — wake both dispatchers
     sem_post(&gs->hip_turn_sem);
     sem_post(&gs->asp_turn_sem);
 }
@@ -109,6 +109,7 @@ static void init_player(Entity& e, int idx, int num_players,
     e.stamina     = 0.0f;
     e.alive       = true;
     e.swap_in_slot = -1;
+    inv_pickup(e, WPN_SPLINTER_STICK); /* starting weapon */
 }
 
 static void init_enemy(Entity& e, int idx, unsigned roll_no,
@@ -125,16 +126,6 @@ static void init_enemy(Entity& e, int idx, unsigned roll_no,
     e.max_stamina = 150;
     e.stamina     = 0.0f;
     e.alive       = true;
-    e.swap_in_slot = -1;
-    // 50% chance enemy carries a non-artifact weapon (won't drop on death per spec)
-    static const WeaponID ENEMY_WPNS[] = {
-        WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_FROSTBOW,
-        WPN_OBSIDIAN_AXE,   WPN_THUNDERSTAFF
-    };
-    if (rng_range(seed, 0, 1) == 1) {
-        int wi = rng_range(seed, 0, 4);
-        inv_pickup(e, ENEMY_WPNS[wi]);
-    }
 }
 
 /* ── Shared state initialisation ──────────────────────────────────── */
@@ -147,6 +138,7 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
     sem_init(&gs->action_sem,     1, 0);
     sem_init(&gs->hip_turn_sem,   1, 0);
     sem_init(&gs->asp_turn_sem,   1, 0);
+    gs->render_ready = false;
     sem_init(&gs->artifact_mutex, 1, 1);
     sem_init(&gs->log_mutex,      1, 1);
 
@@ -167,18 +159,14 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
         init_enemy(gs->entities[num_players + i], num_players + i,
                    roll_no, g_seed, i);
 
-    /* Lifecycle tracking queues — populated immediately */
-    gs->num_active_players = 0;
-    gs->num_active_enemies = 0;
-    for (int i = 0; i < num_players; ++i)
-        gs->active_players[gs->num_active_players++] = i;
-    for (int i = 0; i < num_enemies; ++i)
-        gs->active_enemies[gs->num_active_enemies++] = num_players + i;
-
-    /* Artifact table */
+    /* Artifact resource table (spec s7) */
     gs->artifacts[0] = {WPN_SOLAR_CORE,    ArtifactState::FREE, -1, true };
     gs->artifacts[1] = {WPN_LUNAR_BLADE,   ArtifactState::FREE, -1, true };
     gs->artifacts[2] = {WPN_ECLIPSE_RELIC, ArtifactState::FREE, -1, false};
+
+    /* Initialise waiting_for table — no entity is waiting for anything */
+    for (int i = 0; i < MAX_ENTITIES; ++i)
+        gs->waiting_for[i] = WPN_NONE;
 }
 
 /* ── Logging ──────────────────────────────────────────────────────── */
@@ -192,35 +180,129 @@ static void game_log(const char* msg)
     sem_post(&gs->log_mutex);
 }
 
-/* ── Update lifecycle tracking queues (spec s2) ─────────────────── */
-static void remove_from_tracking(int entity_idx)
+
+/* ════════════════════════════════════════════════════════════════════
+ * Artifact Resource Table Helpers  (spec s7)
+ *
+ * Every acquisition and release of an artifact MUST go through these
+ * functions. They lock artifact_mutex, consult the table, update it
+ * immediately, and release the lock — satisfying the spec requirement
+ * that "access to this table must be protected" and "the table must
+ * be updated immediately after any change".
+ *
+ * waiting_for[] is also managed here to support deadlock detection.
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* Try to acquire artifact `wpn` for entity `entity_idx`.
+ * Sets waiting_for[entity_idx] before attempting so deadlock monitor
+ * can see the intent. Returns true on success. */
+static bool artifact_acquire(int entity_idx, WeaponID wpn)
 {
-    const Entity& e = gs->entities[entity_idx];
-    if (e.type == EntityType::PLAYER) {
-        for (int i = 0; i < gs->num_active_players; ++i) {
-            if (gs->active_players[i] == entity_idx) {
-                /* Shift remaining entries left */
-                for (int j = i; j < gs->num_active_players - 1; ++j)
-                    gs->active_players[j] = gs->active_players[j+1];
-                --gs->num_active_players;
-                break;
-            }
-        }
-    } else {
-        for (int i = 0; i < gs->num_active_enemies; ++i) {
-            if (gs->active_enemies[i] == entity_idx) {
-                for (int j = i; j < gs->num_active_enemies - 1; ++j)
-                    gs->active_enemies[j] = gs->active_enemies[j+1];
-                --gs->num_active_enemies;
-                break;
-            }
+    sem_wait(&gs->artifact_mutex);
+
+    /* Mark intent — "I want this artifact" */
+    gs->waiting_for[entity_idx] = wpn;
+
+    /* Search table */
+    for (int a = 0; a < NUM_ARTIFACTS; ++a) {
+        ArtifactEntry& ae = gs->artifacts[a];
+        if (!ae.exists || ae.weapon != wpn) continue;
+
+        if (ae.state == ArtifactState::FREE) {
+            ae.state   = ArtifactState::HELD;
+            ae.held_by = entity_idx;
+            gs->waiting_for[entity_idx] = WPN_NONE;  /* got it */
+            sem_post(&gs->artifact_mutex);
+            return true;
+        } else {
+            /* Already held — stay waiting (deadlock monitor will resolve) */
+            sem_post(&gs->artifact_mutex);
+            return false;
         }
     }
+
+    /* Artifact not in table (e.g. Eclipse Relic not yet introduced) */
+    gs->waiting_for[entity_idx] = WPN_NONE;
+    sem_post(&gs->artifact_mutex);
+    return false;
+}
+
+/* Introduce the Eclipse Relic into the global pool when first picked up. */
+static void artifact_introduce_eclipse(int entity_idx)
+{
+    sem_wait(&gs->artifact_mutex);
+    for (int a = 0; a < NUM_ARTIFACTS; ++a) {
+        if (gs->artifacts[a].weapon == WPN_ECLIPSE_RELIC) {
+            if (!gs->artifacts[a].exists) {
+                gs->artifacts[a].exists   = true;
+                gs->artifacts[a].state    = ArtifactState::HELD;
+                gs->artifacts[a].held_by  = entity_idx;
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                    "Eclipse Relic introduced into artifact pool by %s",
+                    gs->entities[entity_idx].name);
+                /* Can't call game_log here (would deadlock on log_mutex
+                 * if called under artifact_mutex). Log after release. */
+                (void)buf;
+            }
+            break;
+        }
+    }
+    sem_post(&gs->artifact_mutex);
+}
+
+/* Release artifact `wpn` held by `entity_idx`. */
+static void artifact_release(int entity_idx, WeaponID wpn)
+{
+    sem_wait(&gs->artifact_mutex);
+    for (int a = 0; a < NUM_ARTIFACTS; ++a) {
+        ArtifactEntry& ae = gs->artifacts[a];
+        if (ae.weapon == wpn && ae.held_by == entity_idx) {
+            ae.state   = ArtifactState::FREE;
+            ae.held_by = -1;
+            break;
+        }
+    }
+    gs->waiting_for[entity_idx] = WPN_NONE;
+    sem_post(&gs->artifact_mutex);
+}
+
+/* Called from apply_action when an artifact weapon is picked up/swapped in. */
+static void artifact_on_pickup(int entity_idx, WeaponID wpn)
+{
+    if (!weapon_def(wpn).is_artifact) return;
+    if (wpn == WPN_ECLIPSE_RELIC) {
+        artifact_introduce_eclipse(entity_idx);
+        game_log("Eclipse Relic introduced! It joins the global artifact pool.");
+    } else {
+        /* Try to acquire immediately — if it fails the entity still holds
+         * the weapon in inventory but the resource table shows contested.
+         * Deadlock monitor will resolve if needed. */
+        if (!artifact_acquire(entity_idx, wpn)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                "%s is waiting to acquire %s (held by another entity)",
+                gs->entities[entity_idx].name, weapon_def(wpn).name);
+            game_log(buf);
+        } else {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                "%s acquired artifact: %s",
+                gs->entities[entity_idx].name, weapon_def(wpn).name);
+            game_log(buf);
+        }
+    }
+}
+
+/* Called from apply_action when an artifact weapon leaves inventory. */
+static void artifact_on_remove(int entity_idx, WeaponID wpn)
+{
+    if (!weapon_def(wpn).is_artifact) return;
+    artifact_release(entity_idx, wpn);
     char buf[128];
     snprintf(buf, sizeof(buf),
-             "[Lifecycle] %s removed from tracking queue (active p=%d e=%d)",
-             gs->entities[entity_idx].name,
-             gs->num_active_players, gs->num_active_enemies);
+        "%s released artifact: %s",
+        gs->entities[entity_idx].name, weapon_def(wpn).name);
     game_log(buf);
 }
 
@@ -243,7 +325,6 @@ static void apply_action(int actor_idx, const Action& act)
         if (tgt.hp <= 0) {
             tgt.hp = 0; tgt.alive = false;
             if (tgt.type == EntityType::ENEMY) ++gs->enemies_killed;
-            remove_from_tracking(act.target_idx);
         }
         break;
     }
@@ -257,12 +338,6 @@ static void apply_action(int actor_idx, const Action& act)
         break;
     }
     case ActionType::USE_WEAPON: {
-        // Spec: weapon swapped in THIS turn cannot be used until next turn
-        if (actor.swap_in_slot >= 0 && actor.swap_in_slot == act.weapon_slot) {
-            snprintf(buf, sizeof(buf),
-                "%s cannot use just-swapped weapon this turn!", actor.name);
-            actor.stamina = 0; break;
-        }
         Entity& tgt = gs->entities[act.target_idx];
         WeaponID wid = actor.inventory.slots[act.weapon_slot];
         int dmg = weapon_def(wid).damage;
@@ -273,7 +348,6 @@ static void apply_action(int actor_idx, const Action& act)
         if (tgt.hp <= 0) {
             tgt.hp = 0; tgt.alive = false;
             if (tgt.type == EntityType::ENEMY) ++gs->enemies_killed;
-            remove_from_tracking(act.target_idx);
         }
         break;
     }
@@ -286,21 +360,13 @@ static void apply_action(int actor_idx, const Action& act)
             tgt.hp -= weapon_def(WPN_SOLAR_CORE).damage + weapon_def(WPN_LUNAR_BLADE).damage;
             if (tgt.hp <= 0) {
                 tgt.hp = 0; tgt.alive = false; ++gs->enemies_killed;
-                remove_from_tracking(gs->num_players + (int)(&tgt - &gs->entities[gs->num_players]));
             }
         }
         break;
     }
     case ActionType::SWAP_IN: {
         inv_swap_in(actor, act.swap_wpn);
-        // Spec: cannot use swapped-in weapon until NEXT turn
-        actor.swap_in_slot = -1;
-        for (int s = 0; s < INVENTORY_SLOTS; ++s) {
-            if (actor.inventory.slots[s] == act.swap_wpn &&
-                inv_first_slot_of(actor.inventory, s) == s)
-                { actor.swap_in_slot = s; break; }
-        }
-        snprintf(buf, sizeof(buf), "%s swaps in %s (usable next turn)",
+        snprintf(buf, sizeof(buf), "%s swaps in %s from LTS (costs turn)",
                  actor.name, weapon_def(act.swap_wpn).name);
         actor.stamina = 0;
         break;
@@ -350,45 +416,114 @@ static void trigger_ultimate(int actor_idx)
 }
 
 /* ── Deadlock monitor thread ──────────────────────────────────────── */
+/* ════════════════════════════════════════════════════════════════════
+ * Deadlock Monitor Thread  (spec s7)
+ *
+ * Detects CIRCULAR WAIT among artifact holders.
+ *
+ * Algorithm: Build a "wait-for graph" using waiting_for[].
+ *   - Node = entity
+ *   - Edge A→B means: A is waiting for an artifact currently held by B
+ * If the graph contains a cycle → deadlock.
+ *
+ * Detection: follow the wait chain from each waiting entity. If we
+ * reach an entity we have already visited → cycle found.
+ *
+ * Resolution: force the entity that holds the most-contested artifact
+ * (Solar Core by priority) to release it. Remove it from their
+ * inventory and update the resource table immediately.
+ * ════════════════════════════════════════════════════════════════════ */
 static void* deadlock_monitor(void*)
 {
     while (!g_quit) {
         sleep(1);
         sem_wait(&gs->artifact_mutex);
 
-        int holder_solar = -1, holder_lunar = -1;
-        for (int a = 0; a < NUM_ARTIFACTS; ++a) {
-            const ArtifactEntry& ae = gs->artifacts[a];
-            if (!ae.exists || ae.state != ArtifactState::HELD) continue;
-            if (ae.weapon == WPN_SOLAR_CORE)  holder_solar = ae.held_by;
-            if (ae.weapon == WPN_LUNAR_BLADE) holder_lunar = ae.held_by;
-        }
+        /* ── Build wait-for mapping: entity_idx → entity_idx it waits on ── */
+        int waits_on[MAX_ENTITIES];
+        for (int i = 0; i < MAX_ENTITIES; ++i) waits_on[i] = -1;
 
-        if (holder_solar >= 0 && holder_lunar >= 0 && holder_solar != holder_lunar) {
-            int victim = holder_solar;
-            Entity& e = gs->entities[victim];
-
-            for (int s = 0; s < INVENTORY_SLOTS; ++s) {
-                if (e.inventory.slots[s] == WPN_SOLAR_CORE) {
-                    inv_remove_weapon(e.inventory, s);
+        for (int i = 0; i < gs->total_entities; ++i) {
+            WeaponID w = gs->waiting_for[i];
+            if (w == WPN_NONE) continue;
+            /* Find who holds w */
+            for (int a = 0; a < NUM_ARTIFACTS; ++a) {
+                const ArtifactEntry& ae = gs->artifacts[a];
+                if (ae.exists && ae.weapon == w && ae.state == ArtifactState::HELD) {
+                    waits_on[i] = ae.held_by;
                     break;
                 }
             }
-            for (int a = 0; a < NUM_ARTIFACTS; ++a) {
-                if (gs->artifacts[a].weapon == WPN_SOLAR_CORE) {
-                    gs->artifacts[a].state   = ArtifactState::FREE;
-                    gs->artifacts[a].held_by = -1;
+        }
+
+        /* ── Cycle detection via chain following ── */
+        int deadlock_victim = -1;
+        WeaponID release_wpn = WPN_NONE;
+
+        for (int start = 0; start < gs->total_entities && deadlock_victim < 0; ++start) {
+            if (waits_on[start] < 0) continue;
+
+            /* Follow chain; detect revisit within 16 steps (max entities) */
+            bool visited[MAX_ENTITIES] = {};
+            int cur = start;
+            while (cur >= 0 && !visited[cur]) {
+                visited[cur] = true;
+                cur = waits_on[cur];
+            }
+
+            if (cur >= 0) {
+                /* cur is in a cycle — resolve by forcing cur to release
+                 * the artifact it HOLDS (the one the chain is waiting on) */
+                deadlock_victim = cur;
+                /* Find what cur holds that someone wants */
+                for (int a = 0; a < NUM_ARTIFACTS; ++a) {
+                    const ArtifactEntry& ae = gs->artifacts[a];
+                    if (ae.exists && ae.state == ArtifactState::HELD &&
+                        ae.held_by == cur) {
+                        /* Prefer Solar Core; otherwise take first held */
+                        if (ae.weapon == WPN_SOLAR_CORE || release_wpn == WPN_NONE)
+                            release_wpn = ae.weapon;
+                    }
                 }
             }
+        }
+
+        if (deadlock_victim >= 0 && release_wpn != WPN_NONE) {
+            Entity& victim_e = gs->entities[deadlock_victim];
+
+            /* Remove from victim's inventory */
+            sem_wait(&gs->state_mutex);
+            for (int s = 0; s < INVENTORY_SLOTS; ++s) {
+                if (victim_e.inventory.slots[s] == release_wpn) {
+                    inv_remove_weapon(victim_e.inventory, s);
+                    break;
+                }
+            }
+            sem_post(&gs->state_mutex);
+
+            /* Update resource table immediately via release function */
+            for (int a = 0; a < NUM_ARTIFACTS; ++a) {
+                if (gs->artifacts[a].weapon == release_wpn) {
+                    gs->artifacts[a].state   = ArtifactState::FREE;
+                    gs->artifacts[a].held_by = -1;
+                    break;
+                }
+            }
+            gs->waiting_for[deadlock_victim] = WPN_NONE;
             sem_post(&gs->artifact_mutex);
 
-            char buf[128];
+            /* Log the forced release via artifact_on_remove */
+            artifact_on_remove(deadlock_victim, release_wpn);
+
+            char buf[160];
             snprintf(buf, sizeof(buf),
-                     "DEADLOCK DETECTED: %s forced to release Solar Core", e.name);
+                "DEADLOCK DETECTED: circular wait resolved. "
+                "%s forced to release %s.",
+                victim_e.name, weapon_def(release_wpn).name);
             game_log(buf);
-            continue;
+        } else {
+            sem_post(&gs->artifact_mutex);
         }
-        sem_post(&gs->artifact_mutex);
     }
     return nullptr;
 }
@@ -444,6 +579,9 @@ static int scheduler_tick()
 /* ── Main game loop ───────────────────────────────────────────────── */
 static void arbiter_main_loop()
 {
+    /* Bug 1 fix: wait for SFML render window to open before starting */
+    while (!gs->render_ready && !g_quit) usleep(10000);
+
     struct timespec tick{ 1, 0 };
 
     while (!check_end_conditions()) {
@@ -464,10 +602,8 @@ static void arbiter_main_loop()
         gs->npc_submitted      = false;
         actor.action_ready     = false;
         actor.action_done      = false;
-        actor.swap_in_slot     = -1;  // cooldown expires — weapon now usable
         sem_post(&gs->state_mutex);
 
-        // Post to the correct process only
         if (actor.type == EntityType::PLAYER)
             sem_post(&gs->hip_turn_sem);
         else
@@ -495,51 +631,51 @@ static void arbiter_main_loop()
         sem_post(&gs->state_mutex);
 
         bool ultimate_triggered = (act.type == ActionType::ULTIMATE);
-        bool stun_candidate = false;
-        int  stun_target    = -1;
+        bool stun_triggered = false;
         if ((act.type == ActionType::STRIKE || act.type == ActionType::USE_WEAPON)
             && act.target_idx >= 0 && gs->entities[act.target_idx].alive) {
             unsigned tmp = g_seed;
-            stun_candidate = (rng_range(tmp, 1, 5) == 1);
+            stun_triggered = (rng_range(tmp, 1, 5) == 1);
             g_seed = tmp;
-            stun_target = act.target_idx;
         }
 
         apply_action(ready, act);
 
         if (ultimate_triggered) trigger_ultimate(ready);
+        if (stun_triggered)     deliver_stun(act.target_idx);
 
-        /* Only stun if target survived the hit */
-        if (stun_candidate && stun_target >= 0 && gs->entities[stun_target].alive)
-            deliver_stun(stun_target);
-
-        for (int i = gs->num_players; i < gs->total_entities; ++i)
-        {
+        for (int i = gs->num_players; i < gs->total_entities; ++i) {
             Entity& en = gs->entities[i];
-
-            if (!en.alive && en.stamina >= 0.0f)
-            {
+            if (!en.alive && en.stamina >= 0.0f) {
                 char buf[128];
                 snprintf(buf, sizeof(buf), "%s has been defeated!", en.name);
                 game_log(buf);
                 en.stamina = -1.0f;
 
-                // Spec s10: NPC-held weapons are NOT dropped on death.
-                // Only generate a world drop if enemy held nothing (50% chance).
+                /* Release any artifacts this entity was holding (spec s7) */
+                for (int s2 = 0; s2 < INVENTORY_SLOTS; ++s2) {
+                    WeaponID w = en.inventory.slots[s2];
+                    if (w != WPN_NONE && weapon_def(w).is_artifact) {
+                        if (inv_first_slot_of(en.inventory, s2) == s2)
+                            artifact_on_remove(i, w);
+                    }
+                }
+
+                /* Weapon drop logic (spec s6):
+                 * NPC-held weapons are NOT dropped on death.
+                 * If enemy held nothing, 50% chance of a world drop. */
                 static const WeaponID DROP_TABLE[] = {
                     WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_IRON_HALBERD,
                     WPN_FROSTBOW, WPN_OBSIDIAN_AXE, WPN_THUNDERSTAFF
-                    // Eclipse Relic excluded — dynamic artifact, not a drop
                 };
                 bool enemy_held = false;
                 for (int s2 = 0; s2 < INVENTORY_SLOTS; ++s2)
-                    if (en.inventory.slots[s2] != WPN_NONE)
-                        { enemy_held = true; break; }
+                    if (en.inventory.slots[s2] != WPN_NONE) { enemy_held = true; break; }
 
-                if (!enemy_held &&
-                    rng_range(g_seed, 0, 1) == 1 &&
-                    gs->pending_drop_ready == false)
+                if (!enemy_held && rng_range(g_seed, 0, 1) == 1
+                    && !gs->pending_drop_ready)
                 {
+                    /* Offer drop to the player who made the kill, or first alive player */
                     int offer_to = ready;
                     if (gs->entities[offer_to].type != EntityType::PLAYER) {
                         offer_to = 0;
@@ -547,6 +683,7 @@ static void arbiter_main_loop()
                             if (gs->entities[p].alive) { offer_to = p; break; }
                     }
                     WeaponID drop = DROP_TABLE[rng_range(g_seed, 0, 5)];
+
                     sem_wait(&gs->state_mutex);
                     gs->pending_drop_wpn   = drop;
                     gs->pending_drop_for   = offer_to;
@@ -555,38 +692,33 @@ static void arbiter_main_loop()
                     gs->pending_drop_taken = false;
                     sem_post(&gs->state_mutex);
 
-                    snprintf(buf, sizeof(buf),
-                             "%s dropped a %s! Pick it up?",
+                    snprintf(buf, sizeof(buf), "%s dropped a %s! (waiting for pickup decision)",
                              en.name, weapon_def(drop).name);
                     game_log(buf);
 
-                    // Wait for hip to respond (with timeout)
+                    /* Wait for HIP to respond (30 s timeout) */
                     struct timespec dl{};
                     clock_gettime(CLOCK_REALTIME, &dl);
-                    dl.tv_sec += 30; // 30 s to decide
-
-                    while (!gs->pending_drop_done)
-                    {
-                        struct timespec ns { 0, 20000000 };
+                    dl.tv_sec += 30;
+                    while (!gs->pending_drop_done) {
+                        struct timespec ns{0, 20000000};
                         nanosleep(&ns, nullptr);
                         struct timespec now{};
                         clock_gettime(CLOCK_REALTIME, &now);
-
                         if (now.tv_sec >= dl.tv_sec) break;
                     }
 
-                    if (gs->pending_drop_taken)
-                    {
+                    if (gs->pending_drop_taken) {
                         inv_pickup(gs->entities[offer_to], drop);
+                        artifact_on_pickup(offer_to, drop);
                         snprintf(buf, sizeof(buf), "%s picked up %s!",
                                  gs->entities[offer_to].name, weapon_def(drop).name);
                     } else {
-                        // Spec: if player doesn't pick up, an enemy is guaranteed to
-                        // Find a living enemy and give it the weapon
+                        /* Spec: enemy guaranteed to pick it up if player declines */
                         for (int e2 = gs->num_players; e2 < gs->total_entities; ++e2) {
                             if (gs->entities[e2].alive) {
                                 inv_pickup(gs->entities[e2], drop);
-                                snprintf(buf, sizeof(buf), "Enemy picked up %s!",
+                                snprintf(buf, sizeof(buf), "An enemy picked up %s!",
                                          weapon_def(drop).name);
                                 break;
                             }
@@ -771,6 +903,9 @@ static void* render_thread_fn(void*)
     );
     window.setFramerateLimit(10); /* 10 fps — non-blocking, low CPU */
 
+    /* Signal to arbiter that the window is open — game can now start */
+    gs->render_ready = true;
+
     /* ── Font ── */
     sf::Font font;
     /* Try several common monospace font paths on Ubuntu */
@@ -797,6 +932,92 @@ static void* render_thread_fn(void*)
 
     /* ── Snapshot buffer ── */
     SharedState snap{};
+
+    /* ════════════════════════════════════════════════════════════════
+     * SPLASH SCREEN  — shown for 2.5 seconds at game start
+     * ════════════════════════════════════════════════════════════════ */
+    {
+        sf::Clock splash_clk;
+        const float SPLASH_SECS = 2.5f;
+
+        while (window.isOpen() && !g_quit &&
+               splash_clk.getElapsedTime().asSeconds() < SPLASH_SECS)
+        {
+            sf::Event ev{};
+            while (window.pollEvent(ev)) {
+                if (ev.type == sf::Event::Closed) { g_quit=1; window.close(); }
+                /* Any key or click skips the splash */
+                if (ev.type == sf::Event::KeyPressed ||
+                    ev.type == sf::Event::MouseButtonPressed) {
+                    goto splash_done;
+                }
+            }
+
+            float t   = splash_clk.getElapsedTime().asSeconds();
+            /* Fade in over 0.6s, hold, fade out over 0.5s at end */
+            float alpha = 1.f;
+            if (t < 0.6f)                           alpha = t / 0.6f;
+            else if (t > SPLASH_SECS - 0.5f)        alpha = (SPLASH_SECS - t) / 0.5f;
+            if (alpha < 0.f) alpha = 0.f;
+            if (alpha > 1.f) alpha = 1.f;
+            sf::Uint8 a = static_cast<sf::Uint8>(alpha * 255);
+
+            /* pulse for the subtitle */
+            float pulse = 0.5f + 0.5f * std::sin(t * 3.f);
+            sf::Uint8 sa = static_cast<sf::Uint8>(alpha * (120 + int(pulse * 80)));
+
+            window.clear(sf::Color{4, 6, 14});
+
+            /* Background radial glow */
+            sf::RectangleShape glow({(float)WIN_W,(float)WIN_H});
+            glow.setFillColor({10,20,60,
+                static_cast<sf::Uint8>(static_cast<int>(alpha*40))});
+            window.draw(glow);
+
+            /* Horizontal rule */
+            sf::RectangleShape rl1({(float)WIN_W*0.6f, 1.5f});
+            rl1.setPosition(WIN_W*0.2f, WIN_H/2.f - 58.f);
+            rl1.setFillColor({220,185,80, a}); window.draw(rl1);
+
+            /* Main title */
+            sf::Text title("CHRONO  RIFT", font, 72);
+            title.setFillColor({220, 185, 80, a});
+            title.setStyle(sf::Text::Bold);
+            sf::FloatRect tb = title.getLocalBounds();
+            title.setOrigin(tb.left + tb.width/2.f, tb.top + tb.height/2.f);
+            title.setPosition(WIN_W/2.f, WIN_H/2.f - 10.f);
+            window.draw(title);
+
+            /* Horizontal rule */
+            sf::RectangleShape rl2({(float)WIN_W*0.6f, 1.5f});
+            rl2.setPosition(WIN_W*0.2f, WIN_H/2.f + 50.f);
+            rl2.setFillColor({220,185,80, a}); window.draw(rl2);
+
+            /* Subtitle */
+            sf::Text sub("CS 2006  â  Operating Systems  â  Spring 2026",
+                         font, 16);
+            sub.setFillColor({180, 190, 210, sa});
+            sf::FloatRect sb = sub.getLocalBounds();
+            sub.setOrigin(sb.left + sb.width/2.f, sb.top);
+            sub.setPosition(WIN_W/2.f, WIN_H/2.f + 60.f);
+            window.draw(sub);
+
+            /* "Press any key to skip" hint */
+            if (t > 0.8f) {
+                sf::Uint8 ha = static_cast<sf::Uint8>(
+                    std::min(1.f, (t-0.8f)/0.4f) * alpha * 140);
+                sf::Text hint("Press any key to skip", font, 12);
+                hint.setFillColor({100,110,130, ha});
+                sf::FloatRect hb = hint.getLocalBounds();
+                hint.setOrigin(hb.left + hb.width/2.f, hb.top);
+                hint.setPosition(WIN_W/2.f, WIN_H - 30.f);
+                window.draw(hint);
+            }
+
+            window.display();
+        }
+        splash_done:;
+    }
 
     while (window.isOpen() && !g_quit && !g_render_done) {
 
