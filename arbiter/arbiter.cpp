@@ -887,20 +887,56 @@ static void draw_section_line(sf::RenderTarget &rt,
     rt.draw(t);
 }
 
+/*
+ * PATCH — replace only render_entity_row_sfml() in arbiter/arbiter.cpp
+ * Everything else in that file stays identical.
+ *
+ * Change: prepend a coloured sprite glyph before the entity name.
+ *   Players  →  ★  (filled star, gold)
+ *   Enemies  →  ✦  (four-pointed star, red/orange)
+ *   Stunned  →  ⚡ (lightning, purple)
+ *   Dead     →  ✗  (cross, dim red)
+ */
+
+/* ── sprite helper ── */
+static const char* entity_sprite(const Entity& e)
+{
+    if (!e.alive)                        return "\xe2\x9c\x97 "; // ✗
+    if (e.stunned)                       return "\xe2\x9a\xa1 "; // ⚡
+    if (e.type == EntityType::PLAYER)    return "\xe2\x98\x85 "; // ★
+    /* ENEMY */                          return "\xe2\x9c\xa6 "; // ✦
+}
+
+static sf::Color sprite_color(const Entity& e)
+{
+    if (!e.alive)                        return C_DEAD;
+    if (e.stunned)                       return C_STUN;
+    if (e.type == EntityType::PLAYER)    return {220, 185, 80};  // gold
+    /* ENEMY */                          return {220, 100, 60};  // orange-red
+}
+
+/* ── drop-in replacement for render_entity_row_sfml ── */
 static void render_entity_row_sfml(sf::RenderTarget &rt,
                                    float x, float y, float panel_w,
                                    const Entity &e, bool active,
                                    const sf::Font &font)
 {
-
-    if (active)
-    {
+    /* highlight row if it's this entity's turn */
+    if (active) {
         sf::RectangleShape hl({panel_w - 4.f, ROW_H - 2.f});
         hl.setPosition(x + 2.f, y);
         hl.setFillColor({40, 40, 10, 80});
         rt.draw(hl);
     }
 
+    /* ── sprite glyph ── */
+    sf::Text sprite_t(entity_sprite(e), font, 13);
+    sprite_t.setFillColor(sprite_color(e));
+    sprite_t.setPosition(x + 4.f, y + 5.f);
+    rt.draw(sprite_t);
+    float sprite_w = sprite_t.getLocalBounds().width + 2.f;
+
+    /* ── name ── */
     sf::Color name_col = active      ? C_ACTIVE
                          : !e.alive  ? C_DEAD
                          : e.stunned ? C_STUN
@@ -908,21 +944,20 @@ static void render_entity_row_sfml(sf::RenderTarget &rt,
 
     sf::Text name_t(e.name, font, 13);
     name_t.setFillColor(name_col);
-    name_t.setPosition(x + 6.f, y + 5.f);
-    if (active)
-        name_t.setStyle(sf::Text::Bold);
+    name_t.setPosition(x + 4.f + sprite_w, y + 5.f);
+    if (active) name_t.setStyle(sf::Text::Bold);
     rt.draw(name_t);
 
-    const char *badge = !e.alive ? "[DEAD]" : e.stunned ? "[STUN]"
-                                                        : nullptr;
-    if (badge)
-    {
+    /* ── status badge ── */
+    const char *badge = !e.alive ? "[DEAD]" : e.stunned ? "[STUN]" : nullptr;
+    if (badge) {
         sf::Text bt(badge, font, 11);
         bt.setFillColor(e.stunned ? C_STUN : C_DEAD);
         bt.setPosition(x + 115.f, y + 7.f);
         rt.draw(bt);
     }
 
+    /* ── HP bar ── */
     float bx = x + 165.f;
     draw_bar_sfml(rt, bx, y + 7.f, BAR_W, BAR_H,
                   static_cast<float>(e.hp), static_cast<float>(e.max_hp),
@@ -935,6 +970,7 @@ static void render_entity_row_sfml(sf::RenderTarget &rt,
     hp_t.setPosition(bx + BAR_W + 4.f, y + 6.f);
     rt.draw(hp_t);
 
+    /* ── Stamina bar ── */
     float sx = bx + BAR_W + 70.f;
     float st_val = e.stamina < 0.f ? 0.f : e.stamina;
     draw_bar_sfml(rt, sx, y + 7.f, 120.f, BAR_H,
@@ -954,7 +990,7 @@ static void *render_thread_fn(void *)
 
     sf::RenderWindow window(
         sf::VideoMode(WIN_W, WIN_H),
-        "Chrono Rift  |  CS 2006 Operating Systems",
+        "  CHRONO RIFT ",
         sf::Style::Titlebar | sf::Style::Close);
     window.setFramerateLimit(10);
 
@@ -969,6 +1005,7 @@ static void *render_thread_fn(void *)
         "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
         nullptr};
     bool font_loaded = false;
+    
     for (int i = 0; font_paths[i]; ++i)
     {
         if (font.loadFromFile(font_paths[i]))
@@ -1361,13 +1398,13 @@ int arbiter_main(int argc, char *argv[])
     switch (gs->result)
     {
     case GameResult::WIN:
-        printf("\n=== VICTORY! You defeated %d enemies! ===\n", gs->enemies_killed);
+        printf("\n VICTORY! You defeated %d enemies! \n", gs->enemies_killed);
         break;
     case GameResult::LOSE:
-        printf("\n=== DEFEAT! All players have fallen. ===\n");
+        printf("\n DEFEAT! All players have fallen. \n");
         break;
     case GameResult::QUIT:
-        printf("\n=== Game quit by player. ===\n");
+        printf("\n Game quit by player. \n");
         break;
     default:
         break;
