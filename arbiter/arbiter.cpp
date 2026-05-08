@@ -45,8 +45,10 @@ static void sig_term(int)
 static void sig_alrm(int)
 {
     g_ultimate = 0;
+    
     if (g_asp_pid > 0)
         kill(g_asp_pid, SIGCONT);
+
     sem_post(&gs->hip_turn_sem);
     sem_post(&gs->asp_turn_sem);
 }
@@ -55,23 +57,27 @@ static SharedState *shm_create()
 {
     shm_unlink(SHM_NAME);
     int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+
     if (fd < 0)
     {
         perror("shm_open");
         exit(1);
     }
+
     if (ftruncate(fd, sizeof(SharedState)) < 0)
     {
         perror("ftruncate");
         exit(1);
     }
     void *p = mmap(nullptr, sizeof(SharedState),
-                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    
     if (p == MAP_FAILED)
     {
         perror("mmap");
         exit(1);
     }
+
     close(fd);
     return static_cast<SharedState *>(p);
 }
@@ -80,6 +86,7 @@ static void shm_destroy()
 {
     if (gs)
         munmap(gs, sizeof(SharedState));
+    
     shm_unlink(SHM_NAME);
 }
 
@@ -98,7 +105,6 @@ static void init_player(Entity &e, int idx, int num_players,
     e.stamina = 0.0f;
     e.alive = true;
     e.swap_in_slot = -1;
-    inv_pickup(e, WPN_SPLINTER_STICK);
 }
 
 static void init_enemy(Entity &e, int idx, unsigned roll_no,
@@ -138,12 +144,13 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
     g_seed = roll_no;
 
     char pname[32];
-    for (int i = 0; i < num_players; ++i)
+
+    for (int i = 0; i < num_players; i++)
     {
         snprintf(pname, sizeof(pname), "Player-%d", i + 1);
         init_player(gs->entities[i], i, num_players, roll_no, g_seed, pname);
     }
-    for (int i = 0; i < num_enemies; ++i)
+    for (int i = 0; i < num_enemies; i++)
         init_enemy(gs->entities[num_players + i], num_players + i,
                    roll_no, g_seed, i);
 
@@ -151,14 +158,16 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
     gs->artifacts[1] = {WPN_LUNAR_BLADE, ArtifactState::FREE, -1, true};
     gs->artifacts[2] = {WPN_ECLIPSE_RELIC, ArtifactState::FREE, -1, false};
 
-    for (int i = 0; i < MAX_ENTITIES; ++i)
+    for (int i = 0; i < MAX_ENTITIES; i++)
         gs->waiting_for[i] = WPN_NONE;
 }
 
 static void game_log(const char *msg)
 {
     sem_wait(&gs->log_mutex);
+
     int h = gs->log_head;
+
     strncpy(gs->log[h], msg, LOG_LINE_LEN - 1);
     gs->log[h][LOG_LINE_LEN - 1] = '\0';
     gs->log_head = (h + 1) % LOG_LINES;
@@ -171,9 +180,10 @@ static bool artifact_acquire(int entity_idx, WeaponID wpn)
 
     gs->waiting_for[entity_idx] = wpn;
 
-    for (int a = 0; a < NUM_ARTIFACTS; ++a)
+    for (int a = 0; a < NUM_ARTIFACTS; a++)
     {
-        ArtifactEntry &ae = gs->artifacts[a];
+        ArtifactEntry& ae = gs->artifacts[a];
+        
         if (!ae.exists || ae.weapon != wpn)
             continue;
 
@@ -187,7 +197,6 @@ static bool artifact_acquire(int entity_idx, WeaponID wpn)
         }
         else
         {
-
             sem_post(&gs->artifact_mutex);
             return false;
         }
@@ -201,7 +210,8 @@ static bool artifact_acquire(int entity_idx, WeaponID wpn)
 static void artifact_introduce_eclipse(int entity_idx)
 {
     sem_wait(&gs->artifact_mutex);
-    for (int a = 0; a < NUM_ARTIFACTS; ++a)
+
+    for (int a = 0; a < NUM_ARTIFACTS; a++)
     {
         if (gs->artifacts[a].weapon == WPN_ECLIPSE_RELIC)
         {
@@ -210,6 +220,7 @@ static void artifact_introduce_eclipse(int entity_idx)
                 gs->artifacts[a].exists = true;
                 gs->artifacts[a].state = ArtifactState::HELD;
                 gs->artifacts[a].held_by = entity_idx;
+
                 char buf[128];
                 snprintf(buf, sizeof(buf),
                          "Eclipse Relic introduced into artifact pool by %s",
@@ -226,9 +237,11 @@ static void artifact_introduce_eclipse(int entity_idx)
 static void artifact_release(int entity_idx, WeaponID wpn)
 {
     sem_wait(&gs->artifact_mutex);
-    for (int a = 0; a < NUM_ARTIFACTS; ++a)
+
+    for (int a = 0; a < NUM_ARTIFACTS; a++)
     {
-        ArtifactEntry &ae = gs->artifacts[a];
+        ArtifactEntry& ae = gs->artifacts[a];
+        
         if (ae.weapon == wpn && ae.held_by == entity_idx)
         {
             ae.state = ArtifactState::FREE;
@@ -275,10 +288,13 @@ static void artifact_on_remove(int entity_idx, WeaponID wpn)
 {
     if (!weapon_def(wpn).is_artifact)
         return;
+    
     artifact_release(entity_idx, wpn);
+
     char buf[128];
+
     snprintf(buf, sizeof(buf),
-             "%s released artifact: %s",
+        "%s released artifact: %s",
              gs->entities[entity_idx].name, weapon_def(wpn).name);
     game_log(buf);
 }
@@ -287,7 +303,8 @@ static void apply_action(int actor_idx, const Action &act)
 {
     sem_wait(&gs->state_mutex);
 
-    Entity &actor = gs->entities[actor_idx];
+    Entity& actor = gs->entities[actor_idx];
+    
     char buf[256];
 
     switch (act.type)
@@ -300,10 +317,12 @@ static void apply_action(int actor_idx, const Action &act)
         snprintf(buf, sizeof(buf), "%s strikes %s for %d dmg",
                  actor.name, tgt.name, actor.damage);
         actor.stamina = 0;
+
         if (tgt.hp <= 0)
         {
             tgt.hp = 0;
             tgt.alive = false;
+
             if (tgt.type == EntityType::ENEMY)
                 ++gs->enemies_killed;
         }
@@ -313,10 +332,13 @@ static void apply_action(int actor_idx, const Action &act)
     {
         Entity &tgt = gs->entities[act.target_idx];
         tgt.stamina -= static_cast<float>(actor.damage);
+
         if (tgt.stamina < 0)
             tgt.stamina = 0;
+
         snprintf(buf, sizeof(buf), "%s exhausts %s for %d stamina",
-                 actor.name, tgt.name, actor.damage);
+            actor.name, tgt.name, actor.damage);
+
         actor.stamina = 0;
         break;
     }
@@ -324,11 +346,15 @@ static void apply_action(int actor_idx, const Action &act)
     {
         Entity &tgt = gs->entities[act.target_idx];
         WeaponID wid = actor.inventory.slots[act.weapon_slot];
+
         int dmg = weapon_def(wid).damage;
+
         tgt.hp -= dmg;
         snprintf(buf, sizeof(buf), "%s uses %s on %s for %d dmg",
                  actor.name, weapon_def(wid).name, tgt.name, dmg);
+
         actor.stamina = 0;
+
         if (tgt.hp <= 0)
         {
             tgt.hp = 0;
@@ -342,12 +368,16 @@ static void apply_action(int actor_idx, const Action &act)
     {
         snprintf(buf, sizeof(buf), "*** %s triggers ULTIMATE ABILITY! ***", actor.name);
         actor.stamina = 0;
-        for (int i = gs->num_players; i < gs->total_entities; ++i)
+
+        for (int i = gs->num_players; i < gs->total_entities; i++)
         {
             Entity &tgt = gs->entities[i];
+
             if (!tgt.alive)
                 continue;
+
             tgt.hp -= weapon_def(WPN_SOLAR_CORE).damage + weapon_def(WPN_LUNAR_BLADE).damage;
+
             if (tgt.hp <= 0)
             {
                 tgt.hp = 0;
@@ -369,10 +399,13 @@ static void apply_action(int actor_idx, const Action &act)
     {
         int healed = actor.max_hp / 10;
         actor.hp += healed;
+
         if (actor.hp > actor.max_hp)
             actor.hp = actor.max_hp;
+
         snprintf(buf, sizeof(buf), "%s heals for %d HP", actor.name, healed);
         actor.stamina = 0;
+
         break;
     }
     case ActionType::SKIP:
@@ -393,8 +426,10 @@ static void deliver_stun(int target_idx)
     Entity &tgt = gs->entities[target_idx];
     tgt.stunned = true;
     pid_t pid = tgt.pid;
+
     if (pid > 0)
         kill(pid, SIGUSR1);
+
     char buf[128];
     snprintf(buf, sizeof(buf), "%s is STUNNED for %d seconds!", tgt.name, STUN_DURATION);
     game_log(buf);
@@ -406,6 +441,7 @@ static void trigger_ultimate(int actor_idx)
     g_ultimate = 1;
     gs->phase = GamePhase::ULTIMATE_PAUSE;
     game_log("ULTIMATE! Strategic Process suspended for 10 seconds!");
+
     if (g_asp_pid > 0)
         kill(g_asp_pid, SIGSTOP);
     alarm(ULTIMATE_DURATION);
@@ -690,7 +726,7 @@ static void arbiter_main_loop()
                         break;
                     }
 
-                if (!enemy_held && rng_range(g_seed, 0, 1) == 1 && !gs->pending_drop_ready)
+                if (!enemy_held && rng_range(g_seed, 1, 10) <= 3 && !gs->pending_drop_ready)
                 {
 
                     int offer_to = ready;
