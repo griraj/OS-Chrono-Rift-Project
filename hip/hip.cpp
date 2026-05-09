@@ -14,35 +14,29 @@
 #include <semaphore.h>
 #include <time.h>
 #include <errno.h>
-
 #include <SFML/Graphics.hpp>
 #include <SFML/System.hpp>
 #include <SFML/Window.hpp>
-
 #include "shared_state.h"
 #include "inventory.h"
 
-static SharedState *gs = nullptr;
+static SharedState* gs = nullptr;
 static int g_num_players = 0;
 static volatile sig_atomic_t g_quit = 0;
 static volatile sig_atomic_t g_stunned = 0;
 static sem_t player_sem[MAX_PLAYERS];
-
 static volatile int g_ui_pidx = -1;
 static Action g_ui_result = {};
 static sem_t g_ui_req_sem;
 static sem_t g_ui_done_sem;
 static pthread_mutex_t g_ui_mtx = PTHREAD_MUTEX_INITIALIZER;
-
 static const char *FONT_PATHS[] = {
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
     nullptr};
-
 static void sig_term(int) { g_quit = 1; }
-
 static void sig_stun(int)
 {
     g_stunned = 1;
@@ -54,7 +48,6 @@ static void sig_stun(int)
         gs->entities[stunned_idx].stunned = false;
     g_stunned = 0;
 }
-
 static SharedState *shm_open_existing()
 {
     int fd = -1;
@@ -70,9 +63,7 @@ static SharedState *shm_open_existing()
     close(fd);
     return static_cast<SharedState *>(p);
 }
-
 static const unsigned WW = 900, WH = 700;
-
 static const sf::Color BG{8, 10, 20};
 static const sf::Color PANEL{16, 18, 38};
 static const sf::Color BDR{40, 80, 160};
@@ -91,7 +82,6 @@ static const sf::Color STAM{60, 180, 255};
 static const sf::Color SCAN{0, 20, 60, 15};
 static const sf::Color SEL{20, 50, 100};
 static const sf::Color ULT{255, 100, 200};
-
 static sf::Text T(const sf::Font &f, const std::string &s,
                   unsigned sz, sf::Color c, bool b = false)
 {
@@ -100,14 +90,12 @@ static sf::Text T(const sf::Font &f, const std::string &s,
     if (b) t.setStyle(sf::Text::Bold);
     return t;
 }
-
 static void Tcx(sf::RenderTarget &r, sf::Text t, float cx, float y)
 {
     sf::FloatRect b = t.getLocalBounds();
     t.setOrigin(b.left + b.width / 2.f, b.top);
     t.setPosition(cx, y); r.draw(t);
 }
-
 static void Box(sf::RenderTarget &r, float x, float y, float w, float h,
                 sf::Color fill, sf::Color bdr, float th = 1.5f)
 {
@@ -115,7 +103,6 @@ static void Box(sf::RenderTarget &r, float x, float y, float w, float h,
     s.setFillColor(fill); s.setOutlineColor(bdr);
     s.setOutlineThickness(th); r.draw(s);
 }
-
 static void Bar(sf::RenderTarget &r, float x, float y, float w, float h,
                 float v, float mx, sf::Color c)
 {
@@ -128,7 +115,6 @@ static void Bar(sf::RenderTarget &r, float x, float y, float w, float h,
         Box(r, x, y, w * rt, h, c, c, 0.f);
     }
 }
-
 static void Corners(sf::RenderTarget &r, float x, float y, float w, float h, float sz = 10.f)
 {
     sf::RectangleShape s; s.setFillColor(GOLD);
@@ -139,13 +125,11 @@ static void Corners(sf::RenderTarget &r, float x, float y, float w, float h, flo
     seg(x,y+h-2,sz,2); seg(x,y+h-sz,2,sz);
     seg(x+w-sz,y+h-2,sz,2); seg(x+w-2,y+h-sz,2,sz);
 }
-
 static void Scanlines(sf::RenderTarget &r)
 {
     sf::RectangleShape l({(float)WW, 1.f}); l.setFillColor(SCAN);
     for (unsigned y = 0; y < WH; y += 4) { l.setPosition(0, (float)y); r.draw(l); }
 }
-
 static void Grid(sf::RenderTarget &r)
 {
     sf::RectangleShape l({(float)WW, 1.f}); l.setFillColor({20, 30, 60, 30});
@@ -153,12 +137,10 @@ static void Grid(sf::RenderTarget &r)
     l.setSize({1.f, (float)WH});
     for (unsigned x = 0; x < WW; x += 32) { l.setPosition((float)x, 0); r.draw(l); }
 }
-
 static bool draw_pause_menu(sf::RenderWindow &win, const sf::Font &font)
 {
     sf::FloatRect resume_b = {WW / 2.f - 130.f, WH / 2.f - 10.f, 260.f, 54.f};
     sf::FloatRect quit_b = {WW / 2.f - 130.f, WH / 2.f + 72.f, 260.f, 54.f};
-
     while (win.isOpen() && !g_quit)
     {
         sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
@@ -178,48 +160,39 @@ static bool draw_pause_menu(sf::RenderWindow &win, const sf::Font &font)
                 if (quit_b.contains(msc)) { kill(gs->arbiter_pid, SIGTERM); g_quit = 1; return true; }
             }
         }
-
         sf::RectangleShape dim({(float)WW, (float)WH}); dim.setFillColor({0, 0, 0, 180}); win.draw(dim);
         Box(win, WW/2.f-180.f, WH/2.f-80.f, 360.f, 240.f, PANEL, GOLD, 2.f);
         Corners(win, WW/2.f-180.f, WH/2.f-80.f, 360.f, 240.f, 14.f);
         Tcx(win, T(font, "PAUSED", 28, GOLD, true), WW/2.f, WH/2.f-72.f);
         sf::RectangleShape rl({300.f, 1.f}); rl.setPosition(WW/2.f-150.f, WH/2.f-32.f); rl.setFillColor(BDR); win.draw(rl);
-
         bool rh = resume_b.contains(ms);
         Box(win, resume_b.left, resume_b.top, resume_b.width, resume_b.height,
             rh?sf::Color{10,40,90}:PANEL, rh?ACCENT:BDR, rh?2.f:1.5f);
         Tcx(win, T(font, "RESUME  (P / Esc)", 16, rh?WHITE:DIM, rh), WW/2.f, resume_b.top+16.f);
-
         bool qh = quit_b.contains(ms);
         Box(win, quit_b.left, quit_b.top, quit_b.width, quit_b.height,
             qh?sf::Color{80,10,10}:PANEL, qh?RED:BDR, qh?2.f:1.5f);
         Tcx(win, T(font, "QUIT GAME", 16, qh?WHITE:DIM, qh), WW/2.f, quit_b.top+16.f);
-
         Scanlines(win); win.display();
     }
     return false;
 }
-
 enum class UIMode { WAIT, PICKING };
-
 struct HipUI
 {
     sf::Font font;
     UIMode mode = UIMode::WAIT;
     int pidx = -1;
     float clock_t = 0.f;
-
     enum class Step { ACTION, WEAPON, ENEMY, LTS };
     Step step = Step::ACTION;
     int sel_act = -1;
     int sel_wpn_slot = -1;
     std::string status;
-
     Entity me{};
     Entity ents[MAX_ENTITIES]{};
     int np = 0, nte = 0;
     bool can_ult = false;
-
     struct Btn { sf::FloatRect b; std::string lbl, sub; sf::Color acc; bool enabled = true; };
     std::vector<Btn> action_btns;
     struct EBtn { sf::FloatRect b; int idx; };
@@ -228,32 +201,26 @@ struct HipUI
     std::vector<WBtn> wpn_btns;
     struct LBtn { sf::FloatRect b; int li; WeaponID wid; };
     std::vector<LBtn> lts_btns;
-
     void load_font()
     {
         for (int i = 0; FONT_PATHS[i]; ++i)
             if (font.loadFromFile(FONT_PATHS[i])) return;
     }
-
     void begin_turn(int p)
     {
         pidx = p; mode = UIMode::PICKING; step = Step::ACTION;
         sel_act = -1; sel_wpn_slot = -1; status = "";
-
         sem_wait(&gs->state_mutex);
         me = gs->entities[p];
         memcpy(ents, gs->entities, sizeof(ents));
         np = gs->num_players; nte = gs->total_entities;
         sem_post(&gs->state_mutex);
-
         can_ult = inv_has_weapon(me, WPN_SOLAR_CORE) && inv_has_weapon(me, WPN_LUNAR_BLADE);
-
         action_btns.clear();
         float by = 220.f;
         const float BW = 340.f, BH = 52.f, BG = 8.f, BX = 30.f;
         auto add = [&](const std::string &l, const std::string &s, sf::Color a, bool en = true)
         { action_btns.push_back({{BX,by,BW,BH},l,s,a,en}); by+=BH+BG; };
-
         add("1  Strike", "Direct damage to enemy", RED);
         add("2  Exhaust", "Drain enemy stamina", ORANGE);
         bool hi = false;
@@ -264,12 +231,10 @@ struct HipUI
         add("6  Skip", "50% stamina refund", DIM);
         if (can_ult) add("7  ULTIMATE", "Solar Core + Lunar Blade", ULT);
         add("0  Quit Game", "Send SIGTERM to arbiter", RED);
-
         enemy_btns.clear();
         float ey = 238.f;
         for (int i = np; i < nte; i++)
             if (ents[i].alive) { enemy_btns.push_back({{400.f, ey, WW - 420.f, 38.f}, i}); ey += 44.f; }
-
         wpn_btns.clear();
         float wy = 238.f;
         bool vis[INVENTORY_SLOTS] = {};
@@ -282,13 +247,11 @@ struct HipUI
             wpn_btns.push_back({{30.f, wy, 340.f, 42.f}, s, w}); wy += 48.f;
             for (int k = s; k < INVENTORY_SLOTS && me.inventory.slots[k] == w; k++) vis[k] = true;
         }
-
         lts_btns.clear();
         float ly = 238.f;
         for (int i = 0; i < me.lts.count; i++)
         { lts_btns.push_back({{30.f, ly, 340.f, 42.f}, i, me.lts.weapons[i]}); ly += 48.f; }
     }
-
     bool handle_click(sf::Vector2f ms, Action &out)
     {
         if (step == Step::ACTION)
@@ -343,71 +306,15 @@ struct HipUI
         }
         return false;
     }
-
     void handle_esc()
     {
         if (step != Step::ACTION) { step = Step::ACTION; sel_act = -1; status = ""; }
     }
-
-    void draw_wait(sf::RenderWindow &win)
-    {
-        win.clear(BG); Grid(win);
-        Tcx(win, T(font, "CHRONO RIFT", 28, GOLD, true), WW/2.f, 14.f);
-
-        sem_wait(&gs->state_mutex);
-        int np2 = gs->num_players, ne = gs->num_enemies, ct = gs->current_turn;
-        int kills = gs->enemies_killed;
-        Entity ents2[MAX_ENTITIES];
-        memcpy(ents2, gs->entities, sizeof(ents2));
-        sem_post(&gs->state_mutex);
-
-        char kb[32]; snprintf(kb, sizeof(kb), "Kills: %d / %d", kills, MAX_ENEMIES_KILL);
-        Tcx(win, T(font, kb, 13, sf::Color{80,200,80}), WW/2.f, 48.f);
-
-        float col_w = (WW - 40.f) / 2.f;
-        auto ph = T(font, "PLAYERS", 12, sf::Color{100,120,180}); ph.setPosition(24.f, 74.f); win.draw(ph);
-        float py = 96.f;
-        for (int i = 0; i < np2; i++)
-        {
-            const Entity &e = ents2[i];
-            bool active = (ct == i);
-            sf::Color nc = !e.alive ? sf::Color{80,40,40} : active ? GOLD : WHITE;
-            char ln[80]; snprintf(ln, sizeof(ln), "%s%s  HP:%d/%d  ST:%.0f", e.name, active?" <":"", e.hp, e.max_hp, e.stamina);
-            auto t = T(font, ln, 13, nc); t.setPosition(24.f, py); win.draw(t);
-            float bw = col_w-20.f, fill = e.max_hp>0?(float)e.hp/e.max_hp*bw:0.f;
-            sf::RectangleShape bg({bw,5.f}); bg.setPosition(24.f,py+17.f); bg.setFillColor({30,40,30}); win.draw(bg);
-            sf::RectangleShape bar({fill,5.f}); bar.setPosition(24.f,py+17.f); bar.setFillColor({60,200,80}); win.draw(bar);
-            float sf2 = e.max_stamina>0?e.stamina/e.max_stamina*bw:0.f;
-            sf::RectangleShape sbg({bw,3.f}); sbg.setPosition(24.f,py+24.f); sbg.setFillColor({20,20,50}); win.draw(sbg);
-            sf::RectangleShape sbar({sf2,3.f}); sbar.setPosition(24.f,py+24.f); sbar.setFillColor({60,140,255}); win.draw(sbar);
-            py += 36.f;
-        }
-
-        auto eh = T(font, "ENEMIES", 12, sf::Color{180,80,80}); eh.setPosition(WW/2.f+4.f, 74.f); win.draw(eh);
-        float ey = 96.f;
-        for (int i = 0; i < ne; i++)
-        {
-            const Entity &e = ents2[np2+i];
-            bool active = (ct == np2+i);
-            sf::Color nc = !e.alive?sf::Color{60,30,30}:active?sf::Color{255,160,60}:sf::Color{200,160,160};
-            char ln[80]; snprintf(ln, sizeof(ln), "%s%s  HP:%d  ST:%.0f", e.name, active?" <":"", e.hp, e.stamina);
-            auto t = T(font, ln, 13, nc); t.setPosition(WW/2.f+4.f, ey); win.draw(t);
-            float bw = col_w-20.f, fill = e.max_hp>0?(float)e.hp/e.max_hp*bw:0.f;
-            sf::RectangleShape bg({bw,5.f}); bg.setPosition(WW/2.f+4.f,ey+17.f); bg.setFillColor({40,20,20}); win.draw(bg);
-            sf::RectangleShape bar({fill,5.f}); bar.setPosition(WW/2.f+4.f,ey+17.f); bar.setFillColor({220,60,60}); win.draw(bar);
-            ey += 36.f;
-        }
-
-        Tcx(win, T(font, "P = menu / quit", 11, sf::Color{50,60,80}), WW/2.f, WH-22.f);
-        Scanlines(win); win.display();
-    }
-
     void draw_picking(sf::RenderWindow &win)
     {
         win.clear(BG); Grid(win);
         sem_wait(&gs->state_mutex); memcpy(ents, gs->entities, sizeof(ents)); sem_post(&gs->state_mutex);
         sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
-
         {
             float p = 0.5f + 0.5f * sinf(clock_t * 2.f);
             sf::RectangleShape glow({(float)WW, 52.f}); glow.setFillColor({10,20,60,(sf::Uint8)(20+int(p*15))}); win.draw(glow);
@@ -419,7 +326,6 @@ struct HipUI
             sf::FloatRect pb2 = ph3.getLocalBounds(); ph3.setPosition(WW-pb2.width-20.f, 36.f); win.draw(ph3);
             sf::RectangleShape rule({(float)WW-40.f, 1.f}); rule.setPosition(20.f, 50.f); rule.setFillColor(BDR); win.draw(rule);
         }
-
         Box(win, 20.f, 58.f, WW-40.f, 148.f, PANEL, BDR);
         Corners(win, 20.f, 58.f, WW-40.f, 148.f);
         {
@@ -434,7 +340,6 @@ struct HipUI
             auto sv = T(font, ss.str(), 11, WHITE); sv.setPosition(348.f, 114.f); win.draw(sv);
             std::ostringstream ds; ds << "DMG: " << me.damage << "   SPD: " << me.speed;
             auto dv = T(font, ds.str(), 13, DIM); dv.setPosition(34.f, 138.f); win.draw(dv);
-
             float ix = 450.f, iy = 68.f;
             auto il = T(font, "INVENTORY", 11, DIM); il.setPosition(ix, iy); win.draw(il); iy += 16.f;
             bool vis[INVENTORY_SLOTS] = {}, any = false;
@@ -450,10 +355,8 @@ struct HipUI
             if (!any) { auto et = T(font, "(empty)", 12, DIM); et.setPosition(ix, iy); win.draw(et); }
             if (can_ult) { auto ut = T(font, "*** ULTIMATE AVAILABLE ***", 13, ULT, true); ut.setPosition(34.f, 158.f); win.draw(ut); }
         }
-
         Box(win, 20.f, 214.f, 375.f, WH-224.f, PANEL, BDR);
         Corners(win, 20.f, 214.f, 375.f, WH-224.f);
-
         if (step == Step::ACTION)
         {
             auto lhdr = T(font, "ACTIONS", 11, DIM); lhdr.setPosition(34.f, 220.f); win.draw(lhdr);
@@ -500,7 +403,6 @@ struct HipUI
             auto arr = T(font, ">>>", 22, RED, true); arr.setPosition(34.f, 260.f); win.draw(arr);
             if (sel_act >= 0) { auto ab = T(font, "Action: "+action_btns[sel_act].lbl, 13, ACCENT); ab.setPosition(34.f, 300.f); win.draw(ab); }
         }
-
         Box(win, 400.f, 214.f, WW-420.f, WH-224.f, PANEL, BDR);
         Corners(win, 400.f, 214.f, WW-420.f, WH-224.f);
         {
@@ -530,7 +432,6 @@ struct HipUI
             }
             ey += 44.f;
         }
-
         if (!status.empty())
         {
             float p = 0.5f + 0.5f*sinf(clock_t*4.f);
@@ -541,38 +442,31 @@ struct HipUI
         Scanlines(win); win.display();
     }
 };
-
 struct PlayerArg { int pidx; };
-
 static void *player_thread(void *arg_)
 {
     PlayerArg *a = static_cast<PlayerArg *>(arg_);
     int pidx = a->pidx; delete a;
     gs->entities[pidx].pid = getpid();
-
     while (!g_quit)
     {
         sem_wait(&player_sem[pidx]);
         if (g_quit) break;
         if (gs->current_turn != pidx || !gs->turn_ready || !gs->entities[pidx].alive) continue;
-
         if (gs->entities[pidx].stunned || g_stunned)
         {
             Action act{ActionType::SKIP,-1,-1,WPN_NONE};
             sem_wait(&gs->state_mutex); gs->entities[pidx].pending_action = act; gs->entities[pidx].action_ready = true; sem_post(&gs->state_mutex);
             sem_post(&gs->action_sem); continue;
         }
-
         pthread_mutex_lock(&g_ui_mtx); g_ui_pidx = pidx; pthread_mutex_unlock(&g_ui_mtx);
         sem_post(&g_ui_req_sem); sem_wait(&g_ui_done_sem);
-
         Action act = g_ui_result;
         sem_wait(&gs->state_mutex); gs->entities[pidx].pending_action = act; gs->entities[pidx].action_ready = true; sem_post(&gs->state_mutex);
         sem_post(&gs->action_sem);
     }
     return nullptr;
 }
-
 static void *dispatcher(void *)
 {
     while (!g_quit)
@@ -585,17 +479,20 @@ static void *dispatcher(void *)
     }
     return nullptr;
 }
-
 int main(int argc, char *argv[])
 {
     if (argc < 3) { fprintf(stderr, "Usage: hip <roll_no> <num_players>\n"); return 1; }
     g_num_players = atoi(argv[2]);
     gs = shm_open_existing();
 
+    // ── CHANGE 1: Wait for the arbiter's SFML render window to be fully ready
+    //   before creating (and showing) the HIP window.
+    while (!gs->render_ready && !g_quit)
+        usleep(50000);
+
     struct sigaction sa{};
     sa.sa_handler = sig_term; sigaction(SIGTERM, &sa, nullptr);
     sa.sa_handler = sig_stun; sigaction(SIGUSR1, &sa, nullptr);
-
     sem_init(&g_ui_req_sem, 0, 0); sem_init(&g_ui_done_sem, 0, 0);
     for (int i = 0; i < g_num_players; i++) sem_init(&player_sem[i], 0, 0);
 
@@ -603,25 +500,23 @@ int main(int argc, char *argv[])
                          sf::Style::Titlebar | sf::Style::Close);
     win.setFramerateLimit(60); win.setVerticalSyncEnabled(false);
 
-    HipUI ui; ui.load_font();
+    // ── CHANGE 2: Start hidden — only show when it's a player's turn.
+    win.setVisible(false);
 
+    HipUI ui; ui.load_font();
     pthread_t disp_tid; pthread_create(&disp_tid, nullptr, dispatcher, nullptr);
     pthread_t ptids[MAX_PLAYERS];
     for (int i = 0; i < g_num_players; i++)
     { auto *a = new PlayerArg{i}; pthread_create(&ptids[i], nullptr, player_thread, a); }
-
     sf::Clock clk;
-
     while (!g_quit && gs->phase != GamePhase::GAME_OVER && win.isOpen())
     {
         ui.clock_t = clk.getElapsedTime().asSeconds();
-
         if (gs->pending_drop_ready && !gs->pending_drop_done)
         {
             WeaponID dwpn = gs->pending_drop_wpn;
             int dfor = gs->pending_drop_for;
             bool taken = false;
-
             if (dfor >= 0 && dfor < g_num_players)
             {
                 sf::RenderWindow dwin(sf::VideoMode(480, 240), "Weapon Drop!", sf::Style::Titlebar|sf::Style::Close);
@@ -657,13 +552,11 @@ int main(int argc, char *argv[])
                     sf::FloatRect qb=qt.getLocalBounds(); qt.setOrigin(qb.left+qb.width/2.f,qb.top); qt.setPosition(240.f,86.f); dwin.draw(qt);
                     auto hint=T(ui.font,"Y / Enter = Yes     N / Esc = No",11,sf::Color{80,90,110});
                     sf::FloatRect hb=hint.getLocalBounds(); hint.setOrigin(hb.left+hb.width/2.f,hb.top); hint.setPosition(240.f,112.f); dwin.draw(hint);
-
                     bool yh=yes_b.contains(ms);
                     sf::RectangleShape ybox({yes_b.width,yes_b.height}); ybox.setPosition(yes_b.left,yes_b.top);
                     ybox.setFillColor(yh?sf::Color{10,50,20}:sf::Color{16,18,35}); ybox.setOutlineColor(yh?sf::Color{60,220,120}:sf::Color{40,80,60}); ybox.setOutlineThickness(1.5f); dwin.draw(ybox);
                     auto yt=T(ui.font,"YES (Y)",16,yh?sf::Color{60,220,120}:sf::Color{80,100,80},yh);
                     sf::FloatRect ytb=yt.getLocalBounds(); yt.setOrigin(ytb.left+ytb.width/2.f,ytb.top); yt.setPosition(yes_b.left+yes_b.width/2.f,yes_b.top+12.f); dwin.draw(yt);
-
                     bool nh=no_b.contains(ms);
                     sf::RectangleShape nbox({no_b.width,no_b.height}); nbox.setPosition(no_b.left,no_b.top);
                     nbox.setFillColor(nh?sf::Color{50,10,10}:sf::Color{16,18,35}); nbox.setOutlineColor(nh?sf::Color{220,60,60}:sf::Color{80,40,40}); nbox.setOutlineThickness(1.5f); dwin.draw(nbox);
@@ -672,23 +565,20 @@ int main(int argc, char *argv[])
                     dwin.display();
                 }
             }
-
             sem_wait(&gs->state_mutex); gs->pending_drop_taken=taken; gs->pending_drop_done=true; sem_post(&gs->state_mutex);
         }
-
         struct timespec ts{};
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 16000000LL;
         if (ts.tv_nsec >= 1000000000LL) { ts.tv_sec++; ts.tv_nsec -= 1000000000LL; }
-
         bool got_req = (sem_timedwait(&g_ui_req_sem, &ts) == 0);
-
         if (got_req)
         {
             pthread_mutex_lock(&g_ui_mtx); int pidx = g_ui_pidx; g_ui_pidx = -1; pthread_mutex_unlock(&g_ui_mtx);
-
             if (pidx >= 0 && pidx < g_num_players)
             {
+                // ── CHANGE 3: Show the window only now that it's a player's turn.
+                win.setVisible(true);
                 ui.begin_turn(pidx);
                 Action result{}; bool done = false;
                 while (!done && !g_quit && win.isOpen())
@@ -710,26 +600,34 @@ int main(int argc, char *argv[])
                     if (!done) ui.draw_picking(win);
                 }
                 if (g_quit) result={ActionType::SKIP,-1,-1,WPN_NONE};
-                g_ui_result=result; ui.mode=UIMode::WAIT;
+                g_ui_result=result;
+
+                // ── CHANGE 4: Hide the window immediately after the player submits
+                //   their move — no more waiting/idle screen between turns.
+                win.setVisible(false);
+                ui.mode=UIMode::WAIT;
             }
             else { g_ui_result={ActionType::SKIP,-1,-1,WPN_NONE}; ui.mode=UIMode::WAIT; }
             sem_post(&g_ui_done_sem);
         }
-
+        // Drain any OS window events while hidden so the window stays responsive.
         sf::Event ev{};
         while (win.pollEvent(ev))
         {
             if (ev.type==sf::Event::Closed) { g_quit=1; kill(gs->arbiter_pid,SIGTERM); }
-            if (ev.type==sf::Event::KeyPressed&&ev.key.code==sf::Keyboard::P) draw_pause_menu(win,ui.font);
+            if (ev.type==sf::Event::KeyPressed&&ev.key.code==sf::Keyboard::P)
+            {
+                win.setVisible(true);
+                draw_pause_menu(win,ui.font);
+                win.setVisible(false);
+            }
         }
-        if (ui.mode==UIMode::WAIT) ui.draw_wait(win);
+        // ── CHANGE 5: No draw_wait() call — window is hidden between turns.
     }
-
     if (win.isOpen()) win.close();
     g_quit=1;
     for (int i=0;i<g_num_players;i++) sem_post(&player_sem[i]);
     sem_post(&gs->hip_turn_sem); sem_post(&g_ui_req_sem); sem_post(&g_ui_done_sem);
-
     pthread_join(disp_tid, nullptr);
     for (int i=0;i<g_num_players;i++) pthread_join(ptids[i],nullptr);
     for (int i=0;i<g_num_players;i++) sem_destroy(&player_sem[i]);
