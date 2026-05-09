@@ -29,7 +29,7 @@ all: $(TARGETS)
 
 # ── Arbiter (includes SFML renderer + deadlock monitor + launcher) ────────────
 arbiter_bin: arbiter/arbiter.cpp arbiter/inventory.cpp arbiter/main_launcher.cpp \
-             arbiter/inventory.h arbiter/shared_state.h
+             arbiter/inventory.h arbiter/shared_state.h arbiter/sprite_draw.inl
 	$(CXX) $(CXXFLAGS) \
 	    arbiter/arbiter.cpp \
 	    arbiter/inventory.cpp \

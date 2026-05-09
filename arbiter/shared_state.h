@@ -160,7 +160,6 @@ enum class GameResult : int
 
 struct SharedState
 {
-
     Entity entities[MAX_ENTITIES];
     int num_players = 0;
     int num_enemies = 0;

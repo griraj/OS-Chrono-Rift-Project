@@ -1,5 +1,4 @@
 
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -188,9 +187,7 @@ int main(int argc, char *argv[])
 
     gs = shm_open_existing();
 
-    struct sigaction sa
-    {
-    };
+    struct sigaction sa{};
     sa.sa_handler = sig_term;
     sigaction(SIGTERM, &sa, nullptr);
     sa.sa_handler = sig_stun;

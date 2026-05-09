@@ -1,5 +1,4 @@
 
-
 #include "inventory.h"
 #include <cstring>
 #include <climits>
@@ -98,7 +97,6 @@ bool inv_pickup(Entity &e, WeaponID id)
 
 bool inv_swap_in(Entity &e, WeaponID id)
 {
-
     int found = -1;
     for (int i = 0; i < e.lts.count; ++i)
         if (e.lts.weapons[i] == id)

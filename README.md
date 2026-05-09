@@ -67,36 +67,31 @@ asp_bin       ← Automated Strategic Process (NPC AI threads)
 ./arbiter_bin
 ```
 
-You will be prompted for:
-1. **Roll Number** — used as the RNG seed (affects HP, enemies, etc.)
-2. **Party size** — 1 to 4 human-controlled characters
+You will see:
+1. **Splash screen** — animated CHRONO RIFT title (4-5s, press any key to skip)
+2. **Launcher** — green-shaded rectangle card to enter Roll Number and Party Size
+3. **Game window** — SFML HUD with pixel-art player/enemy sprites, HP/stamina bars, artifact table, action log
 
-The SFML window opens showing:
-- Real-time HP bars (green = players, red = enemies)
-- Stamina bars (cyan)
-- Artifact ownership table
-- Colour-coded action log
-
-**Player input** is typed in the **terminal** (stdin), not the GUI window.
+**Player input** is done via the HIP window (click actions and targets).
 
 ---
 
-## Controls (terminal)
+## Controls (HIP window)
 
-On each player's turn the terminal shows a HUD and a numbered menu:
+On each player's turn a GUI panel appears:
 
 ```
-1) Strike          (direct damage)
-2) Exhaust         (drain enemy stamina)
-3) Use Weapon      (attack with inventory weapon)
-4) Swap In         (retrieve from Long-Term Storage, costs turn)
-5) Heal            (restore 10% HP)
-6) Skip            (50% stamina refund)
-7) ULTIMATE ABILITY (requires Solar Core + Lunar Blade in inventory)
-0) Quit Game
+Strike          direct damage to enemy
+Exhaust         drain enemy stamina
+Use Weapon      attack with inventory weapon
+Swap In         retrieve from Long-Term Storage (costs turn)
+Heal            restore 10% HP
+Skip            50% stamina refund
+ULTIMATE        requires Solar Core + Lunar Blade in inventory
+Quit Game       sends SIGTERM to arbiter
 ```
 
-Enter the number and follow the prompts for target selection.
+Click an action, then click a target enemy when prompted. Press **P** for pause menu.
 
 ---
 
@@ -106,7 +101,7 @@ Enter the number and follow the prompts for target selection.
 |---|---|
 | Kill 10 enemies total | **VICTORY** |
 | All player characters die | **DEFEAT** |
-| Player chooses option 0 | **QUIT** (sends `SIGTERM` to arbiter) |
+| Player chooses Quit | **QUIT** (sends `SIGTERM` to arbiter) |
 
 ---
 
@@ -125,18 +120,19 @@ chrono_rift/
 ├── Makefile
 ├── README.md
 ├── arbiter/
-│   ├── arbiter.cpp        ← Arbiter + SFML renderer (modified)
-│   ├── main_launcher.cpp  ← Entry point, prompts and execs arbiter_main()
+│   ├── arbiter.cpp        ← Arbiter + SFML renderer + deadlock monitor
+│   ├── main_launcher.cpp  ← Splash + green launcher UI + entry point
+│   ├── sprite_draw.inl    ← Pixel-art sprite helpers (included by arbiter.cpp)
 │   ├── inventory.h
 │   ├── inventory.cpp
-│   └── shared_state.h     ← Single source of truth for shared memory layout
+│   └── shared_state.h
 ├── hip/
-│   ├── hip.cpp            ← Human Interface Process (unchanged)
+│   ├── hip.cpp            ← Human Interface Process
 │   ├── inventory.h
 │   ├── inventory.cpp
 │   └── shared_state.h
 └── asp/
-    ├── asp.cpp            ← Automated Strategic Process (unchanged)
+    ├── asp.cpp            ← Automated Strategic Process
     ├── inventory.h
     ├── inventory.cpp
     └── shared_state.h
@@ -144,17 +140,16 @@ chrono_rift/
 
 ---
 
-## SFML rendering thread details
+## Sprites
 
-The renderer lives in `render_thread_fn()` inside `arbiter.cpp`.
+Each entity in the HUD now displays a 20×20 pixel-art sprite:
 
-- The `sf::RenderWindow` is created **inside the rendering thread** (SFML
-  requires the window and its OpenGL context to stay on one thread).
-- The game-logic threads **never call any SFML function**.
-- Every ~100 ms the renderer acquires `state_mutex`, copies the full
-  `SharedState` into a local snapshot, then releases the lock before drawing.
-- This ensures the scheduler is never blocked by rendering work.
-- Closing the window sets `g_quit = 1` and triggers a clean shutdown.
+| Sprite | Meaning |
+|---|---|
+| Gold knight helmet | Player character |
+| Orange-red horned skull | Enemy |
+| Purple lightning bolt | Stunned entity |
+| Grey cross | Dead entity |
 
 ---
 
@@ -165,5 +160,5 @@ The renderer lives in `render_thread_fn()` inside `arbiter.cpp`.
 | `libsfml-graphics.so not found` | `sudo apt-get install libsfml-dev` |
 | No monospace font, garbled UI | `sudo apt-get install fonts-dejavu-core` |
 | `shm_open` permission denied | Run `sudo rm /dev/shm/chrono_rift_shm` to clean stale segments |
-| Window doesn't open | Ensure a display is available (`$DISPLAY` set, or run with `--display`) |
+| Window doesn't open | Ensure a display is available (`$DISPLAY` set) |
 | `hip_bin` / `asp_bin` not found | Run `./arbiter_bin` from the project root directory |
