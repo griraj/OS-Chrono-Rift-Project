@@ -165,19 +165,19 @@ chrono_rift/
 ├── Makefile
 ├── README.md
 ├── arbiter/
-│   ├── arbiter.cpp        ← Arbiter + SFML renderer + deadlock monitor
-│   ├── main_launcher.cpp  ← Splash + green launcher UI + entry point
-│   ├── sprite_draw.inl    ← Pixel-art sprite helpers (included by arbiter.cpp)
+│   ├── arbiter.cpp       
+│   ├── main_launcher.cpp 
+│   ├── sprite_draw.inl    
 │   ├── inventory.h
 │   ├── inventory.cpp
 │   └── shared_state.h
 ├── hip/
-│   ├── hip.cpp            ← Human Interface Process
+│   ├── hip.cpp           
 │   ├── inventory.h
 │   ├── inventory.cpp
 │   └── shared_state.h
 └── asp/
-    ├── asp.cpp            ← Automated Strategic Process
+    ├── asp.cpp           
     ├── inventory.h
     ├── inventory.cpp
     └── shared_state.h
