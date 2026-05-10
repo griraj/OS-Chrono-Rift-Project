@@ -465,12 +465,16 @@ static void arbiter_main_loop()
         if (stun_triggered) deliver_stun(act.target_idx);
 
         char buf[256];
-        for (int i = gs->num_players; i < gs->total_entities; ++i) {
-            Entity &en = gs->entities[i];
-            if (!en.alive && en.stamina >= 0.0f) {
+        for (int i = gs->num_players; i < gs->total_entities; i++)
+        {
+            Entity& en = gs->entities[i];
+            
+            if (!en.alive && en.stamina >= 0.0f)
+            {
                 snprintf(buf, sizeof(buf), "%s has been defeated!", en.name);
                 game_log(buf);
                 en.stamina = -1.0f;
+
                 for (int s2 = 0; s2 < INVENTORY_SLOTS; ++s2) {
                     WeaponID w = en.inventory.slots[s2];
                     if (w != WPN_NONE && weapon_def(w).is_artifact)
@@ -487,7 +491,8 @@ static void arbiter_main_loop()
 
                 if (!enemy_held && rng_range(g_seed, 1, 10) <= 3 && !gs->pending_drop_ready) {
                     int offer_to = ready;
-                    if (gs->entities[offer_to].type != EntityType::PLAYER) {
+                    if (gs->entities[offer_to].type != EntityType::PLAYER)
+                    {
                         offer_to = 0;
                         for (int p = 0; p < gs->num_players; ++p)
                             if (gs->entities[p].alive) { offer_to = p; break; }
