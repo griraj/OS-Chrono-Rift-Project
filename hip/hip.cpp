@@ -36,7 +36,9 @@ static const char *FONT_PATHS[] = {
     "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
     "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
     nullptr};
+// Handle SIGTERM by requesting quit.
 static void sig_term(int) { g_quit = 1; }
+// Handle stun signal and mark the current player stunned.
 static void sig_stun(int)
 {
     g_stunned = 1;
@@ -82,6 +84,7 @@ static const sf::Color STAM{60, 180, 255};
 static const sf::Color SCAN{0, 20, 60, 15};
 static const sf::Color SEL{20, 50, 100};
 static const sf::Color ULT{255, 100, 200};
+// Create styled SFML text with optional bold formatting.
 static sf::Text T(const sf::Font &f, const std::string &s,
                   unsigned sz, sf::Color c, bool b = false)
 {
@@ -90,12 +93,14 @@ static sf::Text T(const sf::Font &f, const std::string &s,
     if (b) t.setStyle(sf::Text::Bold);
     return t;
 }
+// Center text at a horizontal position and draw it.
 static void Tcx(sf::RenderTarget &r, sf::Text t, float cx, float y)
 {
     sf::FloatRect b = t.getLocalBounds();
     t.setOrigin(b.left + b.width / 2.f, b.top);
     t.setPosition(cx, y); r.draw(t);
 }
+// Render a bordered UI panel rectangle.
 static void Box(sf::RenderTarget &r, float x, float y, float w, float h,
                 sf::Color fill, sf::Color bdr, float th = 1.5f)
 {
@@ -103,6 +108,7 @@ static void Box(sf::RenderTarget &r, float x, float y, float w, float h,
     s.setFillColor(fill); s.setOutlineColor(bdr);
     s.setOutlineThickness(th); r.draw(s);
 }
+// Draw a health/stamina bar with fill proportional to value.
 static void Bar(sf::RenderTarget &r, float x, float y, float w, float h,
                 float v, float mx, sf::Color c)
 {
@@ -115,6 +121,7 @@ static void Bar(sf::RenderTarget &r, float x, float y, float w, float h,
         Box(r, x, y, w * rt, h, c, c, 0.f);
     }
 }
+// Render corner accents for a UI panel.
 static void Corners(sf::RenderTarget &r, float x, float y, float w, float h, float sz = 10.f)
 {
     sf::RectangleShape s; s.setFillColor(GOLD);
@@ -125,11 +132,13 @@ static void Corners(sf::RenderTarget &r, float x, float y, float w, float h, flo
     seg(x,y+h-2,sz,2); seg(x,y+h-sz,2,sz);
     seg(x+w-sz,y+h-2,sz,2); seg(x+w-2,y+h-sz,2,sz);
 }
+// Draw subtle horizontal scanlines over the UI.
 static void Scanlines(sf::RenderTarget &r)
 {
     sf::RectangleShape l({(float)WW, 1.f}); l.setFillColor(SCAN);
     for (unsigned y = 0; y < WH; y += 4) { l.setPosition(0, (float)y); r.draw(l); }
 }
+// Draw a background grid on the HIP window.
 static void Grid(sf::RenderTarget &r)
 {
     sf::RectangleShape l({(float)WW, 1.f}); l.setFillColor({20, 30, 60, 30});
@@ -137,6 +146,7 @@ static void Grid(sf::RenderTarget &r)
     l.setSize({1.f, (float)WH});
     for (unsigned x = 0; x < WW; x += 32) { l.setPosition((float)x, 0); r.draw(l); }
 }
+// Display the pause menu and handle resume/quit.
 static bool draw_pause_menu(sf::RenderWindow &win, const sf::Font &font)
 {
     sf::FloatRect resume_b = {WW / 2.f - 130.f, WH / 2.f - 10.f, 260.f, 54.f};
@@ -201,12 +211,14 @@ struct HipUI
     std::vector<WBtn> wpn_btns;
     struct LBtn { sf::FloatRect b; int li; WeaponID wid; };
     std::vector<LBtn> lts_btns;
-    void load_font()
+    // Load a fallback font from available system paths.
+void load_font()
     {
         for (int i = 0; FONT_PATHS[i]; ++i)
             if (font.loadFromFile(FONT_PATHS[i])) return;
     }
-    void begin_turn(int p)
+    // Prepare UI state and buttons for a player turn.
+void begin_turn(int p)
     {
         pidx = p; mode = UIMode::PICKING; step = Step::ACTION;
         sel_act = -1; sel_wpn_slot = -1; status = "";
@@ -252,7 +264,8 @@ struct HipUI
         for (int i = 0; i < me.lts.count; i++)
         { lts_btns.push_back({{30.f, ly, 340.f, 42.f}, i, me.lts.weapons[i]}); ly += 48.f; }
     }
-    bool handle_click(sf::Vector2f ms, Action &out)
+    // Process mouse clicks and translate them into actions.
+bool handle_click(sf::Vector2f ms, Action &out)
     {
         if (step == Step::ACTION)
         {
@@ -264,12 +277,12 @@ struct HipUI
                 const std::string &l = b.lbl;
                 if (l[0] == '0') { kill(gs->arbiter_pid, SIGTERM); g_quit = 1; out = {ActionType::SKIP,-1,-1,WPN_NONE}; return true; }
                 if (l.find("Strike") != std::string::npos) { step = Step::ENEMY; status = "Click an enemy to strike"; }
-                else if (l.find("Exhaust") != std::string::npos) { step = Step::ENEMY; status = "Click an enemy to exhaust"; }
-                else if (l.find("Weapon") != std::string::npos) { step = Step::WEAPON; status = "Click a weapon to use"; }
-                else if (l.find("Swap") != std::string::npos) { step = Step::LTS; status = "Click weapon from storage"; }
-                else if (l.find("Heal") != std::string::npos) { out = {ActionType::HEAL,-1,-1,WPN_NONE}; return true; }
-                else if (l.find("Skip") != std::string::npos) { out = {ActionType::SKIP,-1,-1,WPN_NONE}; return true; }
-                else if (l.find("ULTIMATE") != std::string::npos) { out = {ActionType::ULTIMATE,-1,-1,WPN_NONE}; return true; }
+else if (l.find("Exhaust") != std::string::npos) { step = Step::ENEMY; status = "Click an enemy to exhaust"; }
+else if (l.find("Weapon") != std::string::npos) { step = Step::WEAPON; status = "Click a weapon to use"; }
+else if (l.find("Swap") != std::string::npos) { step = Step::LTS; status = "Click weapon from storage"; }
+else if (l.find("Heal") != std::string::npos) { out = {ActionType::HEAL,-1,-1,WPN_NONE}; return true; }
+else if (l.find("Skip") != std::string::npos) { out = {ActionType::SKIP,-1,-1,WPN_NONE}; return true; }
+else if (l.find("ULTIMATE") != std::string::npos) { out = {ActionType::ULTIMATE,-1,-1,WPN_NONE}; return true; }
                 return false;
             }
         }
@@ -306,11 +319,13 @@ struct HipUI
         }
         return false;
     }
-    void handle_esc()
+    // Handle ESC input to return UI to action selection.
+void handle_esc()
     {
         if (step != Step::ACTION) { step = Step::ACTION; sel_act = -1; status = ""; }
     }
-    void draw_picking(sf::RenderWindow &win)
+    // Draw the current player action selection screen.
+void draw_picking(sf::RenderWindow &win)
     {
         win.clear(BG); Grid(win);
         sem_wait(&gs->state_mutex); memcpy(ents, gs->entities, sizeof(ents)); sem_post(&gs->state_mutex);
@@ -376,7 +391,7 @@ struct HipUI
                 if (!b.sub.empty()) { auto st = T(font, b.sub, 11, hov?ACCENT:DIM); st.setPosition(b.b.left+14.f, b.b.top+b.b.height-18.f); win.draw(st); }
             }
         }
-        else if (step == Step::WEAPON)
+else if (step == Step::WEAPON)
         {
             auto lhdr = T(font, "SELECT WEAPON  (ESC=back)", 11, ACCENT); lhdr.setPosition(34.f, 220.f); win.draw(lhdr);
             for (auto &wb : wpn_btns)
@@ -387,7 +402,7 @@ struct HipUI
                 auto wt = T(font, ws.str(), 14, hov?WHITE:DIM); wt.setPosition(wb.b.left+8.f, wb.b.top+12.f); win.draw(wt);
             }
         }
-        else if (step == Step::LTS)
+else if (step == Step::LTS)
         {
             auto lhdr = T(font, "LONG-TERM STORAGE  (ESC=back)", 11, PURPLE); lhdr.setPosition(34.f, 220.f); win.draw(lhdr);
             for (auto &lb : lts_btns)
@@ -479,14 +494,15 @@ static void *dispatcher(void *)
     }
     return nullptr;
 }
+// Launch the arbiter binary with seed and player count.
 int main(int argc, char *argv[])
 {
     if (argc < 3) { fprintf(stderr, "Usage: hip <roll_no> <num_players>\n"); return 1; }
     g_num_players = atoi(argv[2]);
     gs = shm_open_existing();
 
-    // ── CHANGE 1: Wait for the arbiter's SFML render window to be fully ready
-    //   before creating (and showing) the HIP window.
+
+
     while (!gs->render_ready && !g_quit)
         usleep(50000);
 
@@ -498,9 +514,13 @@ int main(int argc, char *argv[])
 
     sf::RenderWindow win(sf::VideoMode(WW, WH), "Chrono Rift - Player Actions",
                          sf::Style::Titlebar | sf::Style::Close);
+    auto desktop = sf::VideoMode::getDesktopMode();
+    if (desktop.width >= WW && desktop.height >= WH) {
+        win.setPosition({int((desktop.width - WW) / 2), int((desktop.height - WH) / 2)});
+    }
     win.setFramerateLimit(60); win.setVerticalSyncEnabled(false);
 
-    // ── CHANGE 2: Start hidden — only show when it's a player's turn.
+
     win.setVisible(false);
 
     HipUI ui; ui.load_font();
@@ -520,6 +540,10 @@ int main(int argc, char *argv[])
             if (dfor >= 0 && dfor < g_num_players)
             {
                 sf::RenderWindow dwin(sf::VideoMode(480, 240), "Weapon Drop!", sf::Style::Titlebar|sf::Style::Close);
+                auto dd = sf::VideoMode::getDesktopMode();
+                if (dd.width >= 480 && dd.height >= 240) {
+                    dwin.setPosition({int((dd.width - 480) / 2), int((dd.height - 240) / 2)});
+                }
                 dwin.setFramerateLimit(60);
                 sf::FloatRect yes_b = {60.f,162.f,150.f,44.f}, no_b = {270.f,162.f,150.f,44.f};
                 while (dwin.isOpen())
@@ -577,7 +601,10 @@ int main(int argc, char *argv[])
             pthread_mutex_lock(&g_ui_mtx); int pidx = g_ui_pidx; g_ui_pidx = -1; pthread_mutex_unlock(&g_ui_mtx);
             if (pidx >= 0 && pidx < g_num_players)
             {
-                // ── CHANGE 3: Show the window only now that it's a player's turn.
+
+                if (desktop.width >= WW && desktop.height >= WH) {
+                    win.setPosition({int((desktop.width - WW) / 2), int((desktop.height - WH) / 2)});
+                }
                 win.setVisible(true);
                 ui.begin_turn(pidx);
                 Action result{}; bool done = false;
@@ -602,15 +629,15 @@ int main(int argc, char *argv[])
                 if (g_quit) result={ActionType::SKIP,-1,-1,WPN_NONE};
                 g_ui_result=result;
 
-                // ── CHANGE 4: Hide the window immediately after the player submits
-                //   their move — no more waiting/idle screen between turns.
+
+
                 win.setVisible(false);
                 ui.mode=UIMode::WAIT;
             }
             else { g_ui_result={ActionType::SKIP,-1,-1,WPN_NONE}; ui.mode=UIMode::WAIT; }
             sem_post(&g_ui_done_sem);
         }
-        // Drain any OS window events while hidden so the window stays responsive.
+
         sf::Event ev{};
         while (win.pollEvent(ev))
         {
@@ -622,7 +649,7 @@ int main(int argc, char *argv[])
                 win.setVisible(false);
             }
         }
-        // ── CHANGE 5: No draw_wait() call — window is hidden between turns.
+
     }
     if (win.isOpen()) win.close();
     g_quit=1;

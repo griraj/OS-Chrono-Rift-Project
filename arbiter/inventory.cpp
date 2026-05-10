@@ -3,6 +3,7 @@
 #include <cstring>
 #include <climits>
 
+// Check whether the slot starts a weapon block.
 static bool is_first_slot(const Inventory &inv, int i)
 {
     if (inv.slots[i] == WPN_NONE)
@@ -12,6 +13,7 @@ static bool is_first_slot(const Inventory &inv, int i)
     return inv.slots[i - 1] != inv.slots[i];
 }
 
+// Count consecutive empty inventory slots from a start.
 static int free_run_length(const Inventory &inv, int start)
 {
     int len = 0;
@@ -20,6 +22,7 @@ static int free_run_length(const Inventory &inv, int start)
     return len;
 }
 
+// Find a free inventory range large enough for a weapon.
 int inv_find_fit(const Inventory &inv, int size)
 {
     for (int i = 0; i <= INVENTORY_SLOTS - size; ++i)
@@ -28,12 +31,14 @@ int inv_find_fit(const Inventory &inv, int size)
     return -1;
 }
 
+// Place a weapon ID into consecutive inventory slots.
 void inv_add_weapon(Inventory &inv, WeaponID id, int start, int size)
 {
     for (int i = start; i < start + size; ++i)
         inv.slots[i] = id;
 }
 
+// Remove a weapon block from inventory starting at slot.
 WeaponID inv_remove_weapon(Inventory &inv, int start)
 {
     if (start < 0 || start >= INVENTORY_SLOTS)
@@ -46,6 +51,7 @@ WeaponID inv_remove_weapon(Inventory &inv, int start)
     return id;
 }
 
+// Find the first slot index occupied by the same weapon.
 int inv_first_slot_of(const Inventory &inv, int slot)
 {
     if (slot < 0 || slot >= INVENTORY_SLOTS)
@@ -59,6 +65,7 @@ int inv_first_slot_of(const Inventory &inv, int slot)
     return s;
 }
 
+// Pick up a weapon, rearranging inventory or LTS if needed.
 bool inv_pickup(Entity &e, WeaponID id)
 {
     const int need = weapon_def(id).slots;
@@ -95,6 +102,7 @@ bool inv_pickup(Entity &e, WeaponID id)
     return false;
 }
 
+// Swap a stored weapon into inventory from long-term storage.
 bool inv_swap_in(Entity &e, WeaponID id)
 {
     int found = -1;
@@ -114,6 +122,7 @@ bool inv_swap_in(Entity &e, WeaponID id)
     return inv_pickup(e, id);
 }
 
+// Check whether the entity has a weapon in inventory.
 bool inv_has_weapon(const Entity &e, WeaponID id)
 {
     for (int i = 0; i < INVENTORY_SLOTS; ++i)

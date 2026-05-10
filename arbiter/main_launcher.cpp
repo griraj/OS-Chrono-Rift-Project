@@ -1,8 +1,4 @@
-/*
- * main_launcher.cpp — SFML graphical launcher (SFML 2.x compatible)
- * Splash screen unchanged (4-5s animated title).
- * Launcher: clean dark green-shaded single rectangle UI.
- */
+
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +11,7 @@
 
 extern int arbiter_main(int, char*[]);
 
-/* ── Palette (shared) ── */
+
 static const sf::Color C_BG       {  8,  10,  20 };
 static const sf::Color C_GOLD     {220, 185,  80 };
 static const sf::Color C_WHITE    {230, 235, 245 };
@@ -26,22 +22,18 @@ static const sf::Color C_SCAN     {  0,  20,  60,  18 };
 static const unsigned WIN_W = 860;
 static const unsigned WIN_H = 620;
 
-/* ── Splash palette ── */
+
 static const sf::Color C_BORDER   { 40,  80, 160 };
 static const sf::Color C_PANEL    { 16,  18,  35 };
 
-/* ── Launcher palette ──────────────────────────────────────────────
- * Background : deep midnight indigo with animated purple hex-grid
- * Window border / corners : warm copper-amber + magenta corner sparks
- * Login card  : dark forest green (kept green as requested)
- * ──────────────────────────────────────────────────────────────── */
-// Background
-static const sf::Color G_DARK      {  6,   8,  22 };   // deep midnight indigo
-// Window outer border — copper-amber
+
+
+static const sf::Color G_DARK      {  6,   8,  22 };   
+
 static const sf::Color WIN_BDR     {190, 110,  30 };
 static const sf::Color WIN_BDR_HI  {255, 175,  60 };
-static const sf::Color WIN_CORNER  {255,  80, 160 };   // magenta-pink corner sparks
-// Login card — forest green
+static const sf::Color WIN_CORNER  {255,  80, 160 };   
+
 static const sf::Color G_PANEL     {  8,  32,  16 };
 static const sf::Color G_BORDER    { 28, 100,  50 };
 static const sf::Color G_BORDER_HI { 55, 190,  95 };
@@ -56,7 +48,7 @@ static const sf::Color G_LAUNCH_BD { 48, 170,  85 };
 static const sf::Color G_RED       {220,  70,  70 };
 static const sf::Color G_GOLD_HI   {220, 185,  80 };
 
-/* ── Letter colours for animated splash title ── */
+
 static const sf::Color LETTER_COLORS[] = {
     {255, 80,  80},  {255,140,  0},  {255,220,  0},
     { 80,220, 80},  { 60,200,255},  {120,100,255},
@@ -64,9 +56,8 @@ static const sf::Color LETTER_COLORS[] = {
     {255,220,  0},  { 80,220, 80},
 };
 
-/* ════════════════════════════════════
- * Shared helpers
- * ════════════════════════════════════ */
+
+// Create styled SFML text from font, string, size and color.
 static sf::Text mkt(const sf::Font& f, const std::string& s,
                     unsigned sz, sf::Color col, bool bold=false)
 {
@@ -76,6 +67,7 @@ static sf::Text mkt(const sf::Font& f, const std::string& s,
     return t;
 }
 
+// Center and draw text horizontally at a target x position.
 static void draw_centered(sf::RenderTarget& rt, sf::Text t, float cx, float y)
 {
     sf::FloatRect b = t.getLocalBounds();
@@ -84,6 +76,7 @@ static void draw_centered(sf::RenderTarget& rt, sf::Text t, float cx, float y)
     rt.draw(t);
 }
 
+// Render a filled rectangle panel with border.
 static void draw_box(sf::RenderTarget& rt,
                      float x, float y, float w, float h,
                      sf::Color fill, sf::Color border, float thick=1.5f)
@@ -93,6 +86,7 @@ static void draw_box(sf::RenderTarget& rt,
     r.setOutlineThickness(thick); rt.draw(r);
 }
 
+// Overlay scanlines across the screen for visual effect.
 static void draw_scanlines(sf::RenderTarget& rt)
 {
     sf::RectangleShape line({static_cast<float>(WIN_W),1.f});
@@ -100,7 +94,8 @@ static void draw_scanlines(sf::RenderTarget& rt)
     for (unsigned y=0; y<WIN_H; y+=4){ line.setPosition(0.f,(float)y); rt.draw(line); }
 }
 
-/* Gold corner brackets */
+
+// Draw decorative corner brackets around a rectangle.
 static void draw_corners(sf::RenderTarget& rt,
                           float x, float y, float w, float h,
                           sf::Color col, float sz=12.f)
@@ -114,7 +109,8 @@ static void draw_corners(sf::RenderTarget& rt,
     seg(x+w-sz,y+h-2.f,sz,2.f); seg(x+w-2.f,y+h-sz,2.f,sz);
 }
 
-/* Animated multi-colour title (used in both splash and launcher header) */
+
+// Render the animated multicolor Chrono Rift title.
 static void draw_colored_title(sf::RenderTarget& rt, const sf::Font& font,
                                 float cx, float y, unsigned char_size,
                                 sf::Uint8 alpha, float time_val)
@@ -150,14 +146,17 @@ static void draw_colored_title(sf::RenderTarget& rt, const sf::Font& font,
     }
 }
 
-/* ════════════════════════════════════
- * SPLASH SCREEN  (unchanged)
- * ════════════════════════════════════ */
+
+// Show the splash screen until user input or timeout.
 static bool run_splash(const sf::Font& font)
 {
     sf::RenderWindow window(sf::VideoMode(WIN_W,WIN_H),"Chrono Rift",
                             sf::Style::Titlebar|sf::Style::Close);
     window.setFramerateLimit(60);
+    auto desktop = sf::VideoMode::getDesktopMode();
+    if (desktop.width >= WIN_W && desktop.height >= WIN_H) {
+        window.setPosition({int((desktop.width - WIN_W) / 2), int((desktop.height - WIN_H) / 2)});
+    }
 
     sf::Texture bg_tex; bool has_bg = bg_tex.loadFromFile("splash.png");
     if (!has_bg) has_bg = bg_tex.loadFromFile("assets/splash.png");
@@ -213,34 +212,36 @@ splash_done:
     window.close(); return true;
 }
 
-/* ════════════════════════════════════
- * LAUNCHER  — green-shaded rectangle
- * ════════════════════════════════════ */
+
 static std::pair<unsigned,int> run_launcher(const sf::Font& font)
 {
     sf::RenderWindow window(sf::VideoMode(WIN_W,WIN_H),"Chrono Rift — Launch",
                             sf::Style::Titlebar|sf::Style::Close);
     window.setFramerateLimit(60);
+    auto desktop = sf::VideoMode::getDesktopMode();
+    if (desktop.width >= WIN_W && desktop.height >= WIN_H) {
+        window.setPosition({int((desktop.width - WIN_W) / 2), int((desktop.height - WIN_H) / 2)});
+    }
 
     std::string roll_str;
     int         party    = 0;
     std::string error_msg;
     sf::Clock   clk;
 
-    /* ── Layout constants ── */
-    // Central card dimensions
+
+
     const float CARD_W  = 520.f;
     const float CARD_H  = 420.f;
     const float CARD_X  = (WIN_W - CARD_W) / 2.f;
     const float CARD_Y  = (WIN_H - CARD_H) / 2.f - 20.f;
 
-    // Roll-number field inside card
+
     const float FLD_X   = CARD_X + 30.f;
     const float FLD_Y   = CARD_Y + 116.f;
     const float FLD_W   = CARD_W - 60.f;
     const float FLD_H   = 52.f;
 
-    // Party size buttons
+
     const float PC_Y    = CARD_Y + 220.f;
     const float PC_H    = 56.f;
     const float PC_W    = (CARD_W - 60.f - 3*10.f) / 4.f;
@@ -250,7 +251,7 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
     const char* pc_lbl[4]  = {"1","2","3","4"};
     const char* pc_sub[4]  = {"SOLO","DUO","TRIO","SQUAD"};
 
-    // Launch button
+
     const float BTN_W   = 240.f;
     const float BTN_H   = 50.f;
     sf::FloatRect launch_b = {CARD_X+(CARD_W-BTN_W)/2.f, CARD_Y+CARD_H-70.f, BTN_W, BTN_H};
@@ -276,10 +277,10 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
 
             if (ev.type==sf::Event::MouseButtonPressed &&
                 ev.mouseButton.button==sf::Mouse::Left){
-                // party cards
+
                 for (int i=0; i<4; i++)
                     if (pc_b[i].contains(ms)) party=i+1;
-                // launch
+
                 if (launch_b.contains(ms)){
                     try_launch:
                     unsigned rn=0; bool ok=!roll_str.empty();
@@ -289,27 +290,27 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
                     else if(party<1) error_msg="Select a party size (1-4)!";
                     else { window.close(); return {rn,party}; }
                 }
-                // click inside field (just focus, nothing needed)
+
             }
         }
 
-        /* ══ DRAW ══ */
+
         window.clear(G_DARK);
 
-        /* ── Midnight indigo background with animated diagonal purple grid ── */
+
         {
-            // Horizontal lines
+
             sf::RectangleShape gl({(float)WIN_W, 1.f});
             gl.setFillColor({30, 20, 70, 28});
             for (unsigned gy=0; gy<WIN_H; gy+=36){
                 gl.setPosition(0,(float)gy); window.draw(gl);
             }
-            // Vertical lines
+
             gl.setSize({1.f,(float)WIN_H});
             for (unsigned gx=0; gx<WIN_W; gx+=36){
                 gl.setPosition((float)gx,0); window.draw(gl);
             }
-            // Diagonal shimmer lines drifting over time
+
             float drift = fmod(t*18.f, 72.f);
             sf::RectangleShape diag({(float)(WIN_W+WIN_H), 1.f});
             diag.setFillColor({80, 50, 160, 18});
@@ -321,23 +322,23 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             }
         }
 
-        /* ── Outer copper-amber window frame (decorative, inset 8px) ── */
+
         {
             float pulse = 0.5f + 0.5f*std::sin(t*1.4f);
             sf::Uint8 ba = (sf::Uint8)(180 + int(pulse*55));
             sf::Color bdr = {WIN_BDR.r, WIN_BDR.g, (sf::Uint8)(WIN_BDR.b + int(pulse*20)), ba};
 
-            // Top bar
+
             sf::RectangleShape bar({(float)WIN_W-16.f, 2.f}); bar.setFillColor(bdr);
             bar.setPosition(8.f, 8.f); window.draw(bar);
-            // Bottom bar
+
             bar.setPosition(8.f, (float)WIN_H-10.f); window.draw(bar);
-            // Left bar
+
             bar.setSize({2.f,(float)WIN_H-16.f}); bar.setPosition(8.f,8.f); window.draw(bar);
-            // Right bar
+
             bar.setPosition((float)WIN_W-10.f, 8.f); window.draw(bar);
 
-            // Magenta-pink corner sparks (L-shaped, 28px arms)
+
             sf::Color cc = {WIN_CORNER.r, WIN_CORNER.g, WIN_CORNER.b, ba};
             sf::RectangleShape arm; arm.setFillColor(cc);
             float M=8.f, S=28.f, T=3.f;
@@ -352,35 +353,35 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             corner(WIN_W-M-S, WIN_H-M-T,-1,-1);
         }
 
-        /* ── Ambient purple glow behind card ── */
+
         {
             float pulse=0.5f+0.5f*std::sin(t*1.8f);
             sf::RectangleShape glow({CARD_W+100.f,CARD_H+100.f});
             glow.setPosition(CARD_X-50.f,CARD_Y-50.f);
             glow.setFillColor({50,20,110,(sf::Uint8)(20+int(pulse*18))});
             window.draw(glow);
-            // inner warmer copper glow right behind card
+
             glow.setSize({CARD_W+30.f,CARD_H+30.f});
             glow.setPosition(CARD_X-15.f,CARD_Y-15.f);
             glow.setFillColor({120,60,10,(sf::Uint8)(12+int(pulse*10))});
             window.draw(glow);
         }
 
-        /* ── Central green card ── */
+
         draw_box(window,CARD_X,CARD_Y,CARD_W,CARD_H, G_PANEL,G_BORDER,2.f);
-        // Card corners use the copper-amber colour for contrast against the green card
+
         draw_corners(window,CARD_X,CARD_Y,CARD_W,CARD_H, WIN_BDR_HI, 18.f);
 
-        /* Inner subtle gradient overlay */
+
         {
             sf::RectangleShape inner({CARD_W-4.f,CARD_H/2.f});
             inner.setPosition(CARD_X+2.f,CARD_Y+2.f);
             inner.setFillColor({20,60,30,20}); window.draw(inner);
         }
 
-        /* ── Title inside card ── */
+
         {
-            /* decorative rule above title */
+
             sf::RectangleShape rl({CARD_W-60.f,1.f});
             rl.setPosition(CARD_X+30.f, CARD_Y+22.f); rl.setFillColor(G_DIM); window.draw(rl);
 
@@ -390,7 +391,7 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             rl2.setPosition(CARD_X+30.f,CARD_Y+74.f); rl2.setFillColor(G_DIM); window.draw(rl2);
         }
 
-        /* ── Roll Number label + field ── */
+
         {
             auto lbl=mkt(font,"ROLL NUMBER  /  RNG SEED",12,G_TITLE);
             lbl.setPosition(FLD_X,CARD_Y+88.f); window.draw(lbl);
@@ -399,18 +400,18 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             sf::Color field_bd = field_hov ? G_BORDER_HI : G_FIELD_BD;
             draw_box(window,FLD_X,FLD_Y,FLD_W,FLD_H,G_FIELD_BG,field_bd,2.f);
 
-            /* blinking cursor */
+
             bool cur_vis = fmod(t,1.0f)<0.55f;
             std::string disp = roll_str + (cur_vis ? "|" : " ");
             auto dt=mkt(font,disp,26,roll_str.empty()?G_DIM:C_WHITE);
             dt.setPosition(FLD_X+12.f,FLD_Y+10.f); window.draw(dt);
 
-            /* hint below field */
+
             auto hint=mkt(font,"Type digits on keyboard",11,G_DIM);
             hint.setPosition(FLD_X,FLD_Y+FLD_H+5.f); window.draw(hint);
         }
 
-        /* ── Party size label + cards ── */
+
         {
             auto lbl2=mkt(font,"PARTY SIZE",12,G_TITLE);
             lbl2.setPosition(FLD_X,PC_Y-20.f); window.draw(lbl2);
@@ -422,21 +423,21 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
                 float thick = (sel||hov)?2.5f:1.5f;
                 draw_box(window,pc_b[i].left,pc_b[i].top,pc_b[i].width,pc_b[i].height,fill,bord,thick);
 
-                /* number */
+
                 auto nt=mkt(font,pc_lbl[i],28,sel?G_BORDER_HI:hov?G_TITLE:G_DIM,sel);
                 sf::FloatRect nb=nt.getLocalBounds();
                 nt.setOrigin(nb.left+nb.width/2.f,nb.top);
                 nt.setPosition(pc_b[i].left+pc_b[i].width/2.f,pc_b[i].top+4.f);
                 window.draw(nt);
 
-                /* sub label */
+
                 auto st=mkt(font,pc_sub[i],10,sel?G_BORDER_HI:G_DIM);
                 sf::FloatRect sb=st.getLocalBounds();
                 st.setOrigin(sb.left+sb.width/2.f,sb.top);
                 st.setPosition(pc_b[i].left+pc_b[i].width/2.f,pc_b[i].top+pc_b[i].height-16.f);
                 window.draw(st);
 
-                /* selected glow */
+
                 if (sel){
                     sf::RectangleShape glow({pc_b[i].width,3.f});
                     glow.setPosition(pc_b[i].left,pc_b[i].top);
@@ -447,7 +448,7 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             }
         }
 
-        /* ── Error / summary ── */
+
         if (!error_msg.empty()){
             float al=200.f+55.f*std::sin(t*6.f);
             auto et=mkt(font,error_msg,13,{220,70,70,(sf::Uint8)al});
@@ -460,7 +461,7 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             draw_centered(window,st,CARD_X+CARD_W/2.f,PC_Y+PC_H+14.f);
         }
 
-        /* ── Launch button ── */
+
         {
             bool ready = !roll_str.empty() && party>=1;
             bool hov   = launch_b.contains(ms);
@@ -478,7 +479,7 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             draw_box(window,launch_b.left,launch_b.top,launch_b.width,launch_b.height,
                      fill,bord,2.f);
 
-            /* glowing top edge when ready */
+
             if (ready){
                 sf::RectangleShape glow({launch_b.width,2.f});
                 glow.setPosition(launch_b.left,launch_b.top);
@@ -508,9 +509,8 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
     return {0,0};
 }
 
-/* ════════════════════════════════════
- * Entry point
- * ════════════════════════════════════ */
+
+// Launch the arbiter binary with seed and player count.
 int main()
 {
     sf::Font font;

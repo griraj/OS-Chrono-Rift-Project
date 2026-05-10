@@ -6,7 +6,7 @@
 ## Overview
 
 Chrono Rift is a multi-process, multi-threaded turn-based tactical game.
-This version runs **natively on Linux** (Ubuntu 22.04+) with no Docker required.
+This version runs **natively on Linux** (Ubuntu 22.04+). A Docker container is also provided for reproducible build and run environments.
 
 ### Key OS concepts preserved
 
@@ -56,6 +56,51 @@ arbiter_bin   ← Game Arbiter + SFML renderer + deadlock monitor
 hip_bin       ← Human Interface Process (player input threads)
 asp_bin       ← Automated Strategic Process (NPC AI threads)
 ```
+
+### Docker build / run
+
+Build the Docker image:
+
+```bash
+docker build -t chrono_rift .
+```
+
+Run the game inside Docker with X11 forwarded to your host display:
+
+```bash
+docker run --rm \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  --workdir /app \
+  --network host \
+  chrono_rift ./arbiter_bin
+```
+
+If you want to mount your local repo into the container, recompile inside the container first:
+
+```bash
+docker run --rm \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v "$(pwd)":/app \
+  --workdir /app \
+  --network host \
+  chrono_rift bash -lc "make && ./arbiter_bin"
+```
+
+If your X server blocks connections from containers, allow local access first:
+
+```bash
+xhost +local:root
+```
+
+Alternatively use Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+This containerized workflow installs the same Ubuntu 22.04 SFML toolchain and runs the game from `/app`.
 
 ---
 

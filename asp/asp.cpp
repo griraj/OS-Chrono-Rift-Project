@@ -23,11 +23,13 @@ static volatile sig_atomic_t g_stun_flag = 0;
 
 static sem_t npc_sem[MAX_ENEMIES];
 
+// Handle SIGTERM by requesting quit.
 static void sig_term(int)
 {
     g_quit = 1;
 }
 
+// Handle stun signal and mark the current enemy stunned.
 static void sig_stun(int)
 {
     g_stun_flag = 1;
@@ -71,6 +73,7 @@ static SharedState *shm_open_existing()
     return static_cast<SharedState *>(p);
 }
 
+// Choose the enemy action based on player health.
 static Action npc_decide(int entity_idx)
 {
     Action act{};
@@ -175,6 +178,7 @@ static void *dispatcher(void *)
     return nullptr;
 }
 
+// Launch the arbiter binary with seed and player count.
 int main(int argc, char *argv[])
 {
     if (argc < 4)

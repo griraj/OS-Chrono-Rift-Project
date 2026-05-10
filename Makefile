@@ -16,10 +16,11 @@ CXXFLAGS := -Wall -Wextra -std=c++17 -pthread -O2
 # SFML + POSIX real-time library
 SFML_LIBS := -lsfml-graphics -lsfml-window -lsfml-system
 LIBS      := $(SFML_LIBS) -lrt
+PWD       := $(shell pwd)
 
 TARGETS := arbiter_bin hip_bin asp_bin
 
-.PHONY: all clean run install-deps
+.PHONY: all clean run install-deps docker-build docker-run
 
 all: $(TARGETS)
 	@echo "──────────────────────────────────────────"
@@ -56,6 +57,17 @@ install-deps:
 	sudo apt-get install -y build-essential libsfml-dev fonts-dejavu-core
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
+docker-build:
+	docker build -t chrono_rift .
+
+docker-run:
+	docker run --rm \
+		-e DISPLAY=$(DISPLAY) \
+		-v /tmp/.X11-unix:/tmp/.X11-unix \
+		--workdir /app \
+		--network host \
+		chrono_rift ./arbiter_bin
+
 clean:
 	rm -f arbiter_bin hip_bin asp_bin
 	@echo "Cleaned build artifacts."

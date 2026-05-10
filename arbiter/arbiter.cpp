@@ -37,8 +37,10 @@ static volatile sig_atomic_t g_ultimate = 0;
 static unsigned g_seed = 0;
 static volatile sig_atomic_t g_render_done = 0;
 
+// Handle SIGTERM by requesting quit.
 static void sig_term(int) { g_quit = 1; }
 
+// Handle ultimate timer expiration and resume turns.
 static void sig_alrm(int)
 {
     g_ultimate = 0;
@@ -59,12 +61,14 @@ static SharedState *shm_create()
     return static_cast<SharedState *>(p);
 }
 
+// Release shared memory and unlink the shared object.
 static void shm_destroy()
 {
     if (gs) munmap(gs, sizeof(SharedState));
     shm_unlink(SHM_NAME);
 }
 
+// Initialize a player entity with default stats.
 static void init_player(Entity &e, int idx, int num_players,
                         unsigned roll_no, unsigned &seed, const char *name)
 {
@@ -78,6 +82,7 @@ static void init_player(Entity &e, int idx, int num_players,
     e.max_stamina = 100; e.stamina = 0.0f; e.alive = true; e.swap_in_slot = -1;
 }
 
+// Initialize an enemy entity with randomized stats.
 static void init_enemy(Entity &e, int idx, unsigned roll_no, unsigned &seed, int local_idx)
 {
     e = Entity{};
@@ -90,6 +95,7 @@ static void init_enemy(Entity &e, int idx, unsigned roll_no, unsigned &seed, int
     e.max_stamina = 150; e.stamina = 0.0f; e.alive = true;
 }
 
+// Build shared game state, entities, and artifacts.
 static void init_shared_state(int num_players, int num_enemies, unsigned roll_no)
 {
     *gs = SharedState{};
@@ -121,6 +127,7 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
     for (int i = 0; i < MAX_ENTITIES; i++) gs->waiting_for[i] = WPN_NONE;
 }
 
+// Append a message to the shared log ring buffer.
 static void game_log(const char *msg)
 {
     sem_wait(&gs->log_mutex);
@@ -131,6 +138,7 @@ static void game_log(const char *msg)
     sem_post(&gs->log_mutex);
 }
 
+// Try to claim a free artifact for an entity.
 static bool artifact_acquire(int entity_idx, WeaponID wpn)
 {
     sem_wait(&gs->artifact_mutex);
@@ -148,6 +156,7 @@ static bool artifact_acquire(int entity_idx, WeaponID wpn)
     sem_post(&gs->artifact_mutex); return false;
 }
 
+// Add the Eclipse Relic to the global artifact state.
 static void artifact_introduce_eclipse(int entity_idx)
 {
     sem_wait(&gs->artifact_mutex);
@@ -164,6 +173,7 @@ static void artifact_introduce_eclipse(int entity_idx)
     sem_post(&gs->artifact_mutex);
 }
 
+// Free an artifact held by an entity.
 static void artifact_release(int entity_idx, WeaponID wpn)
 {
     sem_wait(&gs->artifact_mutex);
@@ -177,6 +187,7 @@ static void artifact_release(int entity_idx, WeaponID wpn)
     sem_post(&gs->artifact_mutex);
 }
 
+// Process artifact acquisition and log the result.
 static void artifact_on_pickup(int entity_idx, WeaponID wpn)
 {
     if (!weapon_def(wpn).is_artifact) return;
@@ -196,6 +207,7 @@ static void artifact_on_pickup(int entity_idx, WeaponID wpn)
     }
 }
 
+// Process artifact release and log the event.
 static void artifact_on_remove(int entity_idx, WeaponID wpn)
 {
     if (!weapon_def(wpn).is_artifact) return;
@@ -206,6 +218,7 @@ static void artifact_on_remove(int entity_idx, WeaponID wpn)
     game_log(buf);
 }
 
+// Execute the selected action for the active entity.
 static void apply_action(int actor_idx, const Action &act)
 {
     sem_wait(&gs->state_mutex);
@@ -274,6 +287,7 @@ static void apply_action(int actor_idx, const Action &act)
     game_log(buf);
 }
 
+// Apply stun effects and notify the target.
 static void deliver_stun(int target_idx)
 {
     Entity &tgt = gs->entities[target_idx];
@@ -285,6 +299,7 @@ static void deliver_stun(int target_idx)
     game_log(buf);
 }
 
+// Start the ultimate phase and pause NPC progress.
 static void trigger_ultimate(int actor_idx)
 {
     (void)actor_idx;
@@ -361,6 +376,7 @@ static void *deadlock_monitor(void *)
     return nullptr;
 }
 
+// Check for win, loss, or quit game end states.
 static bool check_end_conditions()
 {
     if (g_quit) { gs->result = GameResult::QUIT; gs->phase = GamePhase::GAME_OVER; return true; }
@@ -377,6 +393,7 @@ static bool check_end_conditions()
     return false;
 }
 
+// Advance stamina and select the next ready entity.
 static int scheduler_tick()
 {
     sem_wait(&gs->state_mutex);
@@ -393,6 +410,7 @@ static int scheduler_tick()
     return ready;
 }
 
+// Run the arbiter turn scheduler until game over.
 static void arbiter_main_loop()
 {
     while (!gs->render_ready && !g_quit) usleep(10000);
@@ -514,9 +532,7 @@ static void arbiter_main_loop()
     }
 }
 
-/* ════════════════════════════════════════════════════════════════════
- * SFML Renderer
- * ════════════════════════════════════════════════════════════════════ */
+
 static const unsigned WIN_W = 1100;
 static const unsigned WIN_H = 780;
 static const float MARGIN = 18.f;
@@ -541,6 +557,7 @@ static const sf::Color C_ARTIFACT {255,200, 80};
 static const sf::Color C_ULTIMATE {255,100,200};
 static const sf::Color C_SECTION  { 80, 80,140};
 
+// Draw a value bar with a colored fill on screen.
 static void draw_bar_sfml(sf::RenderTarget &rt,
                           float x, float y, float w, float h,
                           float val, float max_val, sf::Color filled_col)
@@ -556,6 +573,7 @@ static void draw_bar_sfml(sf::RenderTarget &rt,
     }
 }
 
+// Draw a standard panel background with border.
 static void draw_panel(sf::RenderTarget &rt, float x, float y, float w, float h)
 {
     sf::RectangleShape panel({w,h}); panel.setPosition(x,y);
@@ -563,6 +581,7 @@ static void draw_panel(sf::RenderTarget &rt, float x, float y, float w, float h)
     rt.draw(panel);
 }
 
+// Draw a section divider with a label.
 static void draw_section_line(sf::RenderTarget &rt, float x, float y, float w,
                               const std::string &label, const sf::Font &font)
 {
@@ -570,19 +589,20 @@ static void draw_section_line(sf::RenderTarget &rt, float x, float y, float w,
     sf::Text t(label,font,13); t.setFillColor(C_SECTION); t.setPosition(x+4.f,y-1.f); rt.draw(t);
 }
 
-/* ── Entity row with pixel-art sprite ── */
+
+// Render a single entity row with sprite and stats.
 static void render_entity_row_sfml(sf::RenderTarget &rt,
                                    float x, float y, float panel_w,
                                    const Entity &e, bool active,
                                    const sf::Font &font)
 {
-    /* Row highlight */
+
     if (active) {
         sf::RectangleShape hl({panel_w-4.f, ROW_H-2.f});
         hl.setPosition(x+2.f, y); hl.setFillColor({40,40,10,80}); rt.draw(hl);
     }
 
-    /* Sprite */
+
     float sx = x + 6.f;
     float sy = y + (ROW_H - SPRITE_H) / 2.f - 1.f;
 
@@ -591,13 +611,13 @@ static void render_entity_row_sfml(sf::RenderTarget &rt,
     else if (e.stunned)
         draw_stun_sprite(rt, sx, sy);
     else if (e.type == EntityType::PLAYER)
-        draw_player_sprite(rt, sx, sy, {220,185,80});  // gold knight
+        draw_player_sprite(rt, sx, sy, {220,185,80});  
     else
-        draw_enemy_sprite(rt, sx, sy, {200,80,40});    // orange-red skull
+        draw_enemy_sprite(rt, sx, sy, {200,80,40});    
 
     float name_x = x + 6.f + SPRITE_W + 4.f;
 
-    /* Name */
+
     sf::Color name_col = active    ? C_ACTIVE
                        : !e.alive  ? C_DEAD
                        : e.stunned ? C_STUN
@@ -608,14 +628,14 @@ static void render_entity_row_sfml(sf::RenderTarget &rt,
     if (active) name_t.setStyle(sf::Text::Bold);
     rt.draw(name_t);
 
-    /* Status badge */
+
     const char *badge = !e.alive ? "[DEAD]" : e.stunned ? "[STUN]" : nullptr;
     if (badge) {
         sf::Text bt(badge, font, 11); bt.setFillColor(e.stunned ? C_STUN : C_DEAD);
         bt.setPosition(x + 130.f, y + 8.f); rt.draw(bt);
     }
 
-    /* HP bar */
+
     float bx = x + 185.f;
     draw_bar_sfml(rt, bx, y+8.f, BAR_W, BAR_H,
                   (float)e.hp, (float)e.max_hp,
@@ -624,7 +644,7 @@ static void render_entity_row_sfml(sf::RenderTarget &rt,
     sf::Text hp_t(hpss.str(), font, 11); hp_t.setFillColor(C_WHITE);
     hp_t.setPosition(bx+BAR_W+4.f, y+7.f); rt.draw(hp_t);
 
-    /* Stamina bar */
+
     float stx = bx + BAR_W + 70.f;
     float st_val = e.stamina < 0.f ? 0.f : e.stamina;
     draw_bar_sfml(rt, stx, y+8.f, 120.f, BAR_H, st_val, (float)e.max_stamina, C_STAMINA);
@@ -638,6 +658,10 @@ static void *render_thread_fn(void *)
     sf::RenderWindow window(sf::VideoMode(WIN_W, WIN_H), "  CHRONO RIFT ",
                             sf::Style::Titlebar | sf::Style::Close);
     window.setFramerateLimit(10);
+    auto desktop = sf::VideoMode::getDesktopMode();
+    if (desktop.width >= WIN_W && desktop.height >= WIN_H) {
+        window.setPosition({int((desktop.width - WIN_W) / 2), int((desktop.height - WIN_H) / 2)});
+    }
     gs->render_ready = true;
 
     sf::Font font;
@@ -650,7 +674,7 @@ static void *render_thread_fn(void *)
 
     SharedState snap{};
 
-    /* Splash inside game window */
+
     {
         sf::Clock splash_clk;
         const float SPLASH_SECS = 2.5f;
@@ -788,6 +812,7 @@ static void *render_thread_fn(void *)
     return nullptr;
 }
 
+// Start arbiter shared memory, threads, and game loop.
 int arbiter_main(int argc, char *argv[])
 {
     if (argc < 3) { fprintf(stderr, "Usage : arbiter <roll_number> <num_players>\n"); return 1; }

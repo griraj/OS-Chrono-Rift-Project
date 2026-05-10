@@ -1,0 +1,9 @@
+arbiter_bin
+hip_bin
+asp_bin
+*.o
+*.exe
+*.log
+*.tmp
+.git
+.gitignore

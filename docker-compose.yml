@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  chrono_rift:
+    build: .
+    working_dir: /app
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    environment:
+      - DISPLAY=${DISPLAY}
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ./arbiter_bin

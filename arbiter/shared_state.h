@@ -206,6 +206,7 @@ struct SharedState
     int num_active_enemies = 0;
 };
 
+// Return a pseudo-random integer within [lo, hi] using seed.
 inline int rng_range(unsigned &seed, int lo, int hi)
 {
     seed = seed * 1664525u + 1013904223u;
