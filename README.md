@@ -112,6 +112,25 @@ This containerized workflow installs the same Ubuntu 22.04 SFML toolchain and ru
 ./arbiter_bin
 ```
 
+If you want the HIP process to run in a second terminal, launch the arbiter manually and skip HIP auto-launch:
+
+```bash
+./arbiter_bin --no-hip <roll_number> <party_size>
+```
+
+Then in another terminal run:
+
+```bash
+./hip_bin <roll_number> <party_size>
+```
+
+For separate local multiplayer HIP windows, use a player index per HIP process:
+
+```bash
+./hip_bin <roll_number> <party_size> 0
+./hip_bin <roll_number> <party_size> 1
+```
+
 You will see:
 1. **Splash screen** — animated CHRONO RIFT title (4-5s, press any key to skip)
 2. **Launcher** — green-shaded rectangle card to enter Roll Number and Party Size

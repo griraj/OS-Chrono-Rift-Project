@@ -1,5 +1,4 @@
 
-
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -213,7 +212,7 @@ splash_done:
 }
 
 
-static std::pair<unsigned,int> run_launcher(const sf::Font& font)
+static std::tuple<unsigned,int,int> run_launcher(const sf::Font& font)
 {
     sf::RenderWindow window(sf::VideoMode(WIN_W,WIN_H),"Chrono Rift — Launch",
                             sf::Style::Titlebar|sf::Style::Close);
@@ -225,22 +224,23 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
 
     std::string roll_str;
     int         party    = 0;
+    int         mp_mode  = -1;
+    int         mp_split = -1;
     std::string error_msg;
     sf::Clock   clk;
 
-
+    enum class LaunchState { ROLL_PARTY, MULTIPLAYER_MODE, MULTIPLAYER_SPLIT };
+    LaunchState state = LaunchState::ROLL_PARTY;
 
     const float CARD_W  = 520.f;
     const float CARD_H  = 420.f;
     const float CARD_X  = (WIN_W - CARD_W) / 2.f;
     const float CARD_Y  = (WIN_H - CARD_H) / 2.f - 20.f;
 
-
     const float FLD_X   = CARD_X + 30.f;
     const float FLD_Y   = CARD_Y + 116.f;
     const float FLD_W   = CARD_W - 60.f;
     const float FLD_H   = 52.f;
-
 
     const float PC_Y    = CARD_Y + 220.f;
     const float PC_H    = 56.f;
@@ -251,10 +251,16 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
     const char* pc_lbl[4]  = {"1","2","3","4"};
     const char* pc_sub[4]  = {"SOLO","DUO","TRIO","SQUAD"};
 
-
     const float BTN_W   = 240.f;
     const float BTN_H   = 50.f;
     sf::FloatRect launch_b = {CARD_X+(CARD_W-BTN_W)/2.f, CARD_Y+CARD_H-70.f, BTN_W, BTN_H};
+
+    sf::FloatRect mp_single_b = {CARD_X + 40.f, CARD_Y + 140.f, CARD_W - 80.f, 60.f};
+    sf::FloatRect mp_multi_b  = {CARD_X + 40.f, CARD_Y + 240.f, CARD_W - 80.f, 60.f};
+
+    sf::FloatRect split_opts[2];
+    split_opts[0] = {CARD_X + 40.f, CARD_Y + 140.f, CARD_W - 80.f, 60.f};
+    split_opts[1] = {CARD_X + 40.f, CARD_Y + 240.f, CARD_W - 80.f, 60.f};
 
     while (window.isOpen()){
         sf::Vector2f ms = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -262,44 +268,81 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
 
         sf::Event ev{};
         while (window.pollEvent(ev)){
-            if (ev.type==sf::Event::Closed) return {0,0};
+            if (ev.type==sf::Event::Closed) return {0,0,0};
 
-            if (ev.type==sf::Event::KeyPressed){
-                auto k = ev.key.code;
-                if (k>=sf::Keyboard::Num0 && k<=sf::Keyboard::Num9 && roll_str.size()<12)
-                    { roll_str+=(char)('0'+(k-sf::Keyboard::Num0)); error_msg.clear(); }
-                if (k>=sf::Keyboard::Numpad0 && k<=sf::Keyboard::Numpad9 && roll_str.size()<12)
-                    { roll_str+=(char)('0'+(k-sf::Keyboard::Numpad0)); error_msg.clear(); }
-                if (k==sf::Keyboard::BackSpace && !roll_str.empty()) roll_str.pop_back();
-                if (k>=sf::Keyboard::Num1 && k<=sf::Keyboard::Num4) party=k-sf::Keyboard::Num0;
-                if (k==sf::Keyboard::Return) goto try_launch;
-            }
-
-            if (ev.type==sf::Event::MouseButtonPressed &&
-                ev.mouseButton.button==sf::Mouse::Left){
-
-                for (int i=0; i<4; i++)
-                    if (pc_b[i].contains(ms)) party=i+1;
-
-                if (launch_b.contains(ms)){
-                    try_launch:
-                    unsigned rn=0; bool ok=!roll_str.empty();
-                    if (ok) for (char c:roll_str) if (!isdigit((unsigned char)c)){ok=false;break;}
-                    if (ok){ rn=(unsigned)std::stoul(roll_str); if(rn==0) ok=false; }
-                    if (!ok)      error_msg="Enter a valid non-zero roll number!";
-                    else if(party<1) error_msg="Select a party size (1-4)!";
-                    else { window.close(); return {rn,party}; }
+            if (state == LaunchState::ROLL_PARTY) {
+                if (ev.type==sf::Event::KeyPressed){
+                    auto k = ev.key.code;
+                    if (k>=sf::Keyboard::Num0 && k<=sf::Keyboard::Num9 && roll_str.size()<12)
+                        { roll_str+=(char)('0'+(k-sf::Keyboard::Num0)); error_msg.clear(); }
+                    if (k>=sf::Keyboard::Numpad0 && k<=sf::Keyboard::Numpad9 && roll_str.size()<12)
+                        { roll_str+=(char)('0'+(k-sf::Keyboard::Numpad0)); error_msg.clear(); }
+                    if (k==sf::Keyboard::BackSpace && !roll_str.empty()) roll_str.pop_back();
+                    if (k>=sf::Keyboard::Num1 && k<=sf::Keyboard::Num4) party=k-sf::Keyboard::Num0;
+                    if (k==sf::Keyboard::Return) {
+                        unsigned rn=0; bool ok=!roll_str.empty();
+                        if (ok) for (char c:roll_str) if (!isdigit((unsigned char)c)){ok=false;break;}
+                        if (ok){ rn=(unsigned)std::stoul(roll_str); if(rn==0) ok=false; }
+                        if (!ok)      error_msg="Enter a valid non-zero roll number!";
+                        else if(party<1) error_msg="Select a party size (1-4)!";
+                        else if(party>=3) { state = LaunchState::MULTIPLAYER_MODE; error_msg.clear(); mp_mode=-1; }
+                        else { window.close(); return {rn,party,0}; }
+                    }
                 }
 
+                if (ev.type==sf::Event::MouseButtonPressed && ev.mouseButton.button==sf::Mouse::Left){
+                    for (int i=0; i<4; i++)
+                        if (pc_b[i].contains(ms)) party=i+1;
+
+                    if (launch_b.contains(ms)){
+                        unsigned rn=0; bool ok=!roll_str.empty();
+                        if (ok) for (char c:roll_str) if (!isdigit((unsigned char)c)){ok=false;break;}
+                        if (ok){ rn=(unsigned)std::stoul(roll_str); if(rn==0) ok=false; }
+                        if (!ok)      error_msg="Enter a valid non-zero roll number!";
+                        else if(party<1) error_msg="Select a party size (1-4)!";
+                        else if(party>=3) { state = LaunchState::MULTIPLAYER_MODE; error_msg.clear(); mp_mode=-1; }
+                        else { window.close(); return {rn,party,0}; }
+                    }
+                }
+            } else if (state == LaunchState::MULTIPLAYER_MODE) {
+                if (ev.type==sf::Event::KeyPressed){
+                    if (ev.key.code==sf::Keyboard::Num1 || ev.key.code==sf::Keyboard::S) { mp_mode=0; state=LaunchState::ROLL_PARTY; }
+                    if (ev.key.code==sf::Keyboard::Num2 || ev.key.code==sf::Keyboard::M) { mp_mode=1; state=LaunchState::MULTIPLAYER_SPLIT; error_msg.clear(); mp_split=-1; }
+                }
+                if (ev.type==sf::Event::MouseButtonPressed && ev.mouseButton.button==sf::Mouse::Left){
+                    if (mp_single_b.contains(ms)) { mp_mode=0; state=LaunchState::ROLL_PARTY; }
+                    if (mp_multi_b.contains(ms))  { mp_mode=1; state=LaunchState::MULTIPLAYER_SPLIT; error_msg.clear(); mp_split=-1; }
+                }
+            } else if (state == LaunchState::MULTIPLAYER_SPLIT) {
+                if (ev.type==sf::Event::KeyPressed){
+                    if (ev.key.code==sf::Keyboard::BackSpace || ev.key.code==sf::Keyboard::Escape) { state=LaunchState::MULTIPLAYER_MODE; mp_split=-1; }
+                    if (party==4) {
+                        if (ev.key.code==sf::Keyboard::Num1) mp_split=1;
+                        if (ev.key.code==sf::Keyboard::Num2) mp_split=2;
+                    } else if (party==3) {
+                        if (ev.key.code==sf::Keyboard::Num1) mp_split=1;
+                    }
+                    if (mp_split>=0 && ev.key.code==sf::Keyboard::Return) {
+                        unsigned rn=(unsigned)std::stoul(roll_str);
+                        window.close(); return {rn, party, mp_split+1};
+                    }
+                }
+                if (ev.type==sf::Event::MouseButtonPressed && ev.mouseButton.button==sf::Mouse::Left){
+                    if (party==4) {
+                        if (split_opts[0].contains(ms)) mp_split=1;
+                        if (split_opts[1].contains(ms)) mp_split=2;
+                        if (mp_split>=0) { unsigned rn=(unsigned)std::stoul(roll_str); window.close(); return {rn, party, mp_split+1}; }
+                    } else if (party==3) {
+                        if (split_opts[0].contains(ms)) mp_split=1;
+                        if (mp_split>=0) { unsigned rn=(unsigned)std::stoul(roll_str); window.close(); return {rn, party, mp_split+1}; }
+                    }
+                }
             }
         }
 
-
         window.clear(G_DARK);
 
-
         {
-
             sf::RectangleShape gl({(float)WIN_W, 1.f});
             gl.setFillColor({30, 20, 70, 28});
             for (unsigned gy=0; gy<WIN_H; gy+=36){
@@ -322,12 +365,10 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             }
         }
 
-
         {
             float pulse = 0.5f + 0.5f*std::sin(t*1.4f);
             sf::Uint8 ba = (sf::Uint8)(180 + int(pulse*55));
             sf::Color bdr = {WIN_BDR.r, WIN_BDR.g, (sf::Uint8)(WIN_BDR.b + int(pulse*20)), ba};
-
 
             sf::RectangleShape bar({(float)WIN_W-16.f, 2.f}); bar.setFillColor(bdr);
             bar.setPosition(8.f, 8.f); window.draw(bar);
@@ -337,7 +378,6 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             bar.setSize({2.f,(float)WIN_H-16.f}); bar.setPosition(8.f,8.f); window.draw(bar);
 
             bar.setPosition((float)WIN_W-10.f, 8.f); window.draw(bar);
-
 
             sf::Color cc = {WIN_CORNER.r, WIN_CORNER.g, WIN_CORNER.b, ba};
             sf::RectangleShape arm; arm.setFillColor(cc);
@@ -353,7 +393,6 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             corner(WIN_W-M-S, WIN_H-M-T,-1,-1);
         }
 
-
         {
             float pulse=0.5f+0.5f*std::sin(t*1.8f);
             sf::RectangleShape glow({CARD_W+100.f,CARD_H+100.f});
@@ -367,11 +406,8 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             window.draw(glow);
         }
 
-
         draw_box(window,CARD_X,CARD_Y,CARD_W,CARD_H, G_PANEL,G_BORDER,2.f);
-
         draw_corners(window,CARD_X,CARD_Y,CARD_W,CARD_H, WIN_BDR_HI, 18.f);
-
 
         {
             sf::RectangleShape inner({CARD_W-4.f,CARD_H/2.f});
@@ -379,9 +415,7 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             inner.setFillColor({20,60,30,20}); window.draw(inner);
         }
 
-
         {
-
             sf::RectangleShape rl({CARD_W-60.f,1.f});
             rl.setPosition(CARD_X+30.f, CARD_Y+22.f); rl.setFillColor(G_DIM); window.draw(rl);
 
@@ -391,126 +425,181 @@ static std::pair<unsigned,int> run_launcher(const sf::Font& font)
             rl2.setPosition(CARD_X+30.f,CARD_Y+74.f); rl2.setFillColor(G_DIM); window.draw(rl2);
         }
 
+        if (state == LaunchState::ROLL_PARTY) {
+            {
+                auto lbl=mkt(font,"ROLL NUMBER  /  RNG SEED",12,G_TITLE);
+                lbl.setPosition(FLD_X,CARD_Y+88.f); window.draw(lbl);
 
-        {
-            auto lbl=mkt(font,"ROLL NUMBER  /  RNG SEED",12,G_TITLE);
-            lbl.setPosition(FLD_X,CARD_Y+88.f); window.draw(lbl);
+                bool field_hov = sf::FloatRect{FLD_X,FLD_Y,FLD_W,FLD_H}.contains(ms);
+                sf::Color field_bd = field_hov ? G_BORDER_HI : G_FIELD_BD;
+                draw_box(window,FLD_X,FLD_Y,FLD_W,FLD_H,G_FIELD_BG,field_bd,2.f);
 
-            bool field_hov = sf::FloatRect{FLD_X,FLD_Y,FLD_W,FLD_H}.contains(ms);
-            sf::Color field_bd = field_hov ? G_BORDER_HI : G_FIELD_BD;
-            draw_box(window,FLD_X,FLD_Y,FLD_W,FLD_H,G_FIELD_BG,field_bd,2.f);
+                bool cur_vis = fmod(t,1.0f)<0.55f;
+                std::string disp = roll_str + (cur_vis ? "|" : " ");
+                auto dt=mkt(font,disp,26,roll_str.empty()?G_DIM:C_WHITE);
+                dt.setPosition(FLD_X+12.f,FLD_Y+10.f); window.draw(dt);
 
+                auto hint=mkt(font,"Type digits on keyboard",11,G_DIM);
+                hint.setPosition(FLD_X,FLD_Y+FLD_H+5.f); window.draw(hint);
+            }
 
-            bool cur_vis = fmod(t,1.0f)<0.55f;
-            std::string disp = roll_str + (cur_vis ? "|" : " ");
-            auto dt=mkt(font,disp,26,roll_str.empty()?G_DIM:C_WHITE);
-            dt.setPosition(FLD_X+12.f,FLD_Y+10.f); window.draw(dt);
+            {
+                auto lbl2=mkt(font,"PARTY SIZE",12,G_TITLE);
+                lbl2.setPosition(FLD_X,PC_Y-20.f); window.draw(lbl2);
 
+                for (int i=0;i<4;i++){
+                    bool sel=(party==i+1), hov=pc_b[i].contains(ms);
+                    sf::Color fill = sel?G_SEL : hov?sf::Color{8,44,18}:G_PANEL;
+                    sf::Color bord = sel?G_BORDER_HI : hov?G_BORDER_HI : G_BORDER;
+                    float thick = (sel||hov)?2.5f:1.5f;
+                    draw_box(window,pc_b[i].left,pc_b[i].top,pc_b[i].width,pc_b[i].height,fill,bord,thick);
 
-            auto hint=mkt(font,"Type digits on keyboard",11,G_DIM);
-            hint.setPosition(FLD_X,FLD_Y+FLD_H+5.f); window.draw(hint);
-        }
+                    auto nt=mkt(font,pc_lbl[i],28,sel?G_BORDER_HI:hov?G_TITLE:G_DIM,sel);
+                    sf::FloatRect nb=nt.getLocalBounds();
+                    nt.setOrigin(nb.left+nb.width/2.f,nb.top);
+                    nt.setPosition(pc_b[i].left+pc_b[i].width/2.f,pc_b[i].top+4.f);
+                    window.draw(nt);
 
+                    auto st=mkt(font,pc_sub[i],10,sel?G_BORDER_HI:G_DIM);
+                    sf::FloatRect sb=st.getLocalBounds();
+                    st.setOrigin(sb.left+sb.width/2.f,sb.top);
+                    st.setPosition(pc_b[i].left+pc_b[i].width/2.f,pc_b[i].top+pc_b[i].height-16.f);
+                    window.draw(st);
 
-        {
-            auto lbl2=mkt(font,"PARTY SIZE",12,G_TITLE);
-            lbl2.setPosition(FLD_X,PC_Y-20.f); window.draw(lbl2);
-
-            for (int i=0;i<4;i++){
-                bool sel=(party==i+1), hov=pc_b[i].contains(ms);
-                sf::Color fill = sel?G_SEL : hov?sf::Color{8,44,18}:G_PANEL;
-                sf::Color bord = sel?G_BORDER_HI : hov?G_BORDER_HI : G_BORDER;
-                float thick = (sel||hov)?2.5f:1.5f;
-                draw_box(window,pc_b[i].left,pc_b[i].top,pc_b[i].width,pc_b[i].height,fill,bord,thick);
-
-
-                auto nt=mkt(font,pc_lbl[i],28,sel?G_BORDER_HI:hov?G_TITLE:G_DIM,sel);
-                sf::FloatRect nb=nt.getLocalBounds();
-                nt.setOrigin(nb.left+nb.width/2.f,nb.top);
-                nt.setPosition(pc_b[i].left+pc_b[i].width/2.f,pc_b[i].top+4.f);
-                window.draw(nt);
-
-
-                auto st=mkt(font,pc_sub[i],10,sel?G_BORDER_HI:G_DIM);
-                sf::FloatRect sb=st.getLocalBounds();
-                st.setOrigin(sb.left+sb.width/2.f,sb.top);
-                st.setPosition(pc_b[i].left+pc_b[i].width/2.f,pc_b[i].top+pc_b[i].height-16.f);
-                window.draw(st);
-
-
-                if (sel){
-                    sf::RectangleShape glow({pc_b[i].width,3.f});
-                    glow.setPosition(pc_b[i].left,pc_b[i].top);
-                    glow.setFillColor(G_BORDER_HI); window.draw(glow);
-                    glow.setPosition(pc_b[i].left,pc_b[i].top+pc_b[i].height-3.f);
-                    window.draw(glow);
+                    if (sel){
+                        sf::RectangleShape glow({pc_b[i].width,3.f});
+                        glow.setPosition(pc_b[i].left,pc_b[i].top);
+                        glow.setFillColor(G_BORDER_HI); window.draw(glow);
+                        glow.setPosition(pc_b[i].left,pc_b[i].top+pc_b[i].height-3.f);
+                        window.draw(glow);
+                    }
                 }
             }
-        }
 
-
-        if (!error_msg.empty()){
-            float al=200.f+55.f*std::sin(t*6.f);
-            auto et=mkt(font,error_msg,13,{220,70,70,(sf::Uint8)al});
-            draw_centered(window,et,CARD_X+CARD_W/2.f,PC_Y+PC_H+14.f);
-        } else if (!roll_str.empty()||party>0){
-            std::ostringstream ss;
-            ss<<"Seed: "<<(roll_str.empty()?"?":roll_str)
-              <<"   Party: "<<(party>0?std::to_string(party):"?");
-            auto st=mkt(font,ss.str(),12,G_DIM);
-            draw_centered(window,st,CARD_X+CARD_W/2.f,PC_Y+PC_H+14.f);
-        }
-
-
-        {
-            bool ready = !roll_str.empty() && party>=1;
-            bool hov   = launch_b.contains(ms);
-            float pulse = 0.5f+0.5f*std::sin(t*3.f);
-
-            sf::Color fill = hov&&ready ? G_LAUNCH_HI : ready ? G_LAUNCH : G_PANEL;
-            sf::Color bord;
-            if (hov&&ready) bord=G_BORDER_HI;
-            else if (ready) bord={
-                (sf::Uint8)(30+int(pulse*30)),
-                (sf::Uint8)(150+int(pulse*50)),
-                (sf::Uint8)(60+int(pulse*20))};
-            else bord={20,50,28};
-
-            draw_box(window,launch_b.left,launch_b.top,launch_b.width,launch_b.height,
-                     fill,bord,2.f);
-
-
-            if (ready){
-                sf::RectangleShape glow({launch_b.width,2.f});
-                glow.setPosition(launch_b.left,launch_b.top);
-                glow.setFillColor({(sf::Uint8)(60+int(pulse*60)),
-                                   (sf::Uint8)(180+int(pulse*40)),
-                                   (sf::Uint8)(80+int(pulse*20)),
-                                   (sf::Uint8)(180+int(pulse*75))});
-                window.draw(glow);
+            if (!error_msg.empty()){
+                float al=200.f+55.f*std::sin(t*6.f);
+                auto et=mkt(font,error_msg,13,{220,70,70,(sf::Uint8)al});
+                draw_centered(window,et,CARD_X+CARD_W/2.f,PC_Y+PC_H+14.f);
+            } else if (!roll_str.empty()||party>0){
+                std::ostringstream ss;
+                ss<<"Seed: "<<(roll_str.empty()?"?":roll_str)
+                  <<"   Party: "<<(party>0?std::to_string(party):"?");
+                auto st=mkt(font,ss.str(),12,G_DIM);
+                draw_centered(window,st,CARD_X+CARD_W/2.f,PC_Y+PC_H+14.f);
             }
 
-            auto lt=mkt(font,"LAUNCH  >",20,ready?(hov?C_WHITE:G_BORDER_HI):G_DIM,ready);
-            sf::FloatRect lb=lt.getLocalBounds();
-            lt.setOrigin(lb.left+lb.width/2.f,lb.top+lb.height/2.f);
-            lt.setPosition(launch_b.left+launch_b.width/2.f,
-                           launch_b.top+launch_b.height/2.f);
-            window.draw(lt);
+            {
+                bool ready = !roll_str.empty() && party>=1;
+                bool hov   = launch_b.contains(ms);
+                float pulse = 0.5f+0.5f*std::sin(t*3.f);
 
-            if (!ready){
-                auto h=mkt(font,"enter roll number and select party size",11,G_DIM);
-                draw_centered(window,h,CARD_X+CARD_W/2.f,launch_b.top+launch_b.height+8.f);
+                sf::Color fill = hov&&ready ? G_LAUNCH_HI : ready ? G_LAUNCH : G_PANEL;
+                sf::Color bord;
+                if (hov&&ready) bord=G_BORDER_HI;
+                else if (ready) bord={
+                    (sf::Uint8)(30+int(pulse*30)),
+                    (sf::Uint8)(150+int(pulse*50)),
+                    (sf::Uint8)(60+int(pulse*20))};
+                else bord={20,50,28};
+
+                draw_box(window,launch_b.left,launch_b.top,launch_b.width,launch_b.height,
+                         fill,bord,2.f);
+
+                if (ready){
+                    sf::RectangleShape glow({launch_b.width,2.f});
+                    glow.setPosition(launch_b.left,launch_b.top);
+                    glow.setFillColor({(sf::Uint8)(60+int(pulse*60)),
+                                       (sf::Uint8)(180+int(pulse*40)),
+                                       (sf::Uint8)(80+int(pulse*20)),
+                                       (sf::Uint8)(180+int(pulse*75))});
+                    window.draw(glow);
+                }
+
+                auto lt=mkt(font,"LAUNCH  >",20,ready?(hov?C_WHITE:G_BORDER_HI):G_DIM,ready);
+                sf::FloatRect lb=lt.getLocalBounds();
+                lt.setOrigin(lb.left+lb.width/2.f,lb.top+lb.height/2.f);
+                lt.setPosition(launch_b.left+launch_b.width/2.f,
+                               launch_b.top+launch_b.height/2.f);
+                window.draw(lt);
+
+                if (!ready){
+                    auto h=mkt(font,"enter roll number and select party size",11,G_DIM);
+                    draw_centered(window,h,CARD_X+CARD_W/2.f,launch_b.top+launch_b.height+8.f);
+                }
             }
+        } else if (state == LaunchState::MULTIPLAYER_MODE) {
+            auto title = mkt(font, "GAME MODE", 12, G_TITLE);
+            title.setPosition(FLD_X, CARD_Y+88.f); window.draw(title);
+
+            bool sh = mp_single_b.contains(ms);
+            draw_box(window, mp_single_b.left, mp_single_b.top, mp_single_b.width, mp_single_b.height,
+                    sh?G_SEL:G_PANEL, sh?G_BORDER_HI:G_BORDER, sh?2.f:1.5f);
+            auto st = mkt(font, "1  SINGLE PLAYER", 18, sh?C_WHITE:G_DIM, sh);
+            sf::FloatRect sb = st.getLocalBounds();
+            st.setOrigin(sb.left+sb.width/2.f, sb.top);
+            st.setPosition(mp_single_b.left+mp_single_b.width/2.f, mp_single_b.top+mp_single_b.height/2.f-8.f);
+            window.draw(st);
+
+            bool mh = mp_multi_b.contains(ms);
+            draw_box(window, mp_multi_b.left, mp_multi_b.top, mp_multi_b.width, mp_multi_b.height,
+                    mh?G_SEL:G_PANEL, mh?G_BORDER_HI:G_BORDER, mh?2.f:1.5f);
+            auto mt = mkt(font, "2  LOCAL MULTIPLAYER", 18, mh?C_WHITE:G_DIM, mh);
+            sf::FloatRect mb = mt.getLocalBounds();
+            mt.setOrigin(mb.left+mb.width/2.f, mb.top);
+            mt.setPosition(mp_multi_b.left+mp_multi_b.width/2.f, mp_multi_b.top+mp_multi_b.height/2.f-8.f);
+            window.draw(mt);
+
+            auto hint = mkt(font, "(1=Single / 2=Multiplayer or click a button)", 11, G_DIM);
+            draw_centered(window, hint, CARD_X+CARD_W/2.f, CARD_Y+CARD_H-40.f);
+        } else if (state == LaunchState::MULTIPLAYER_SPLIT) {
+            std::string title_txt = (party==4) ? "PARTY SPLIT (4 PLAYERS)" : "PARTY SPLIT (3 PLAYERS)";
+            auto title = mkt(font, title_txt, 12, G_TITLE);
+            title.setPosition(FLD_X, CARD_Y+88.f); window.draw(title);
+
+            if (party==4) {
+                std::string split1 = "1  SPLIT 1+3  (P1+P2 vs P3+P4)";
+                std::string split2 = "2  SPLIT 2+2  (P1+P3 vs P2+P4)";
+                bool s1h = split_opts[0].contains(ms);
+                draw_box(window, split_opts[0].left, split_opts[0].top, split_opts[0].width, split_opts[0].height,
+                        s1h?G_SEL:G_PANEL, s1h?G_BORDER_HI:G_BORDER, s1h?2.f:1.5f);
+                auto s1t = mkt(font, split1, 16, s1h?C_WHITE:G_DIM, s1h);
+                sf::FloatRect s1b = s1t.getLocalBounds();
+                s1t.setOrigin(s1b.left+s1b.width/2.f, s1b.top);
+                s1t.setPosition(split_opts[0].left+split_opts[0].width/2.f, split_opts[0].top+split_opts[0].height/2.f-6.f);
+                window.draw(s1t);
+
+                bool s2h = split_opts[1].contains(ms);
+                draw_box(window, split_opts[1].left, split_opts[1].top, split_opts[1].width, split_opts[1].height,
+                        s2h?G_SEL:G_PANEL, s2h?G_BORDER_HI:G_BORDER, s2h?2.f:1.5f);
+                auto s2t = mkt(font, split2, 16, s2h?C_WHITE:G_DIM, s2h);
+                sf::FloatRect s2b = s2t.getLocalBounds();
+                s2t.setOrigin(s2b.left+s2b.width/2.f, s2b.top);
+                s2t.setPosition(split_opts[1].left+split_opts[1].width/2.f, split_opts[1].top+split_opts[1].height/2.f-6.f);
+                window.draw(s2t);
+            } else {
+                std::string split1 = "1  SPLIT 1+2  (P1 vs P2+P3)";
+                bool s1h = split_opts[0].contains(ms);
+                draw_box(window, split_opts[0].left, split_opts[0].top, split_opts[0].width, split_opts[0].height,
+                        s1h?G_SEL:G_PANEL, s1h?G_BORDER_HI:G_BORDER, s1h?2.f:1.5f);
+                auto s1t = mkt(font, split1, 16, s1h?C_WHITE:G_DIM, s1h);
+                sf::FloatRect s1b = s1t.getLocalBounds();
+                s1t.setOrigin(s1b.left+s1b.width/2.f, s1b.top);
+                s1t.setPosition(split_opts[0].left+split_opts[0].width/2.f, split_opts[0].top+split_opts[0].height/2.f-6.f);
+                window.draw(s1t);
+            }
+
+            auto hint = mkt(font, "(select or press key)", 11, G_DIM);
+            draw_centered(window, hint, CARD_X+CARD_W/2.f, CARD_Y+CARD_H-40.f);
         }
 
         draw_scanlines(window);
         window.display();
     }
-    return {0,0};
+    return {0,0,0};
 }
 
 
-// Launch the arbiter binary with seed and player count.
+// Launch the arbiter binary with seed, player count, and multiplayer split.
 int main()
 {
     sf::Font font;
@@ -525,14 +614,15 @@ int main()
 
     if (!run_splash(font)){ printf("Launch cancelled.\n"); return 0; }
 
-    auto [roll_no, num_players] = run_launcher(font);
+    auto [roll_no, num_players, mp_split] = run_launcher(font);
     if (roll_no==0||num_players==0){ printf("Launch cancelled.\n"); return 0; }
 
-    printf("\nLaunching Chrono Rift [seed=%u, players=%d]...\n\n",roll_no,num_players);
+    printf("\nLaunching Chrono Rift [seed=%u, players=%d, multiplayer_split=%d]...\n\n",roll_no,num_players,mp_split);
 
-    char roll_str[16], np_str[4];
+    char roll_str[16], np_str[4], mp_str[4];
     snprintf(roll_str,sizeof(roll_str),"%u",roll_no);
     snprintf(np_str,  sizeof(np_str),  "%d",num_players);
-    char* args[] = {(char*)"arbiter_bin", roll_str, np_str, nullptr};
-    return arbiter_main(3, args);
+    snprintf(mp_str,  sizeof(mp_str),  "%d",mp_split);
+    char* args[] = {(char*)"arbiter_bin", roll_str, np_str, mp_str, nullptr};
+    return arbiter_main(4, args);
 }

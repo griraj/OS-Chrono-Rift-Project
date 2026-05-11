@@ -40,12 +40,19 @@ static volatile sig_atomic_t g_render_done = 0;
 // Handle SIGTERM by requesting quit.
 static void sig_term(int) { g_quit = 1; }
 
+static void notify_hip_processes()
+{
+    int count = gs->num_hip_procs > 0 ? gs->num_hip_procs : (gs->hip_pid > 0 ? 1 : 0);
+    for (int i = 0; i < count; ++i)
+        sem_post(&gs->hip_turn_sem);
+}
+
 // Handle ultimate timer expiration and resume turns.
 static void sig_alrm(int)
 {
     g_ultimate = 0;
     if (g_asp_pid > 0) kill(g_asp_pid, SIGCONT);
-    sem_post(&gs->hip_turn_sem);
+    notify_hip_processes();
     sem_post(&gs->asp_turn_sem);
 }
 
@@ -95,6 +102,9 @@ static void init_enemy(Entity &e, int idx, unsigned roll_no, unsigned &seed, int
     e.max_stamina = 150; e.stamina = 0.0f; e.alive = true;
 }
 
+static int random_enemy_index(unsigned &seed);
+static void assign_loot_to_enemy(WeaponID wpn, unsigned &seed);
+
 // Build shared game state, entities, and artifacts.
 static void init_shared_state(int num_players, int num_enemies, unsigned roll_no)
 {
@@ -123,6 +133,9 @@ static void init_shared_state(int num_players, int num_enemies, unsigned roll_no
     gs->artifacts[0] = {WPN_SOLAR_CORE,   ArtifactState::FREE, -1, true};
     gs->artifacts[1] = {WPN_LUNAR_BLADE,  ArtifactState::FREE, -1, true};
     gs->artifacts[2] = {WPN_ECLIPSE_RELIC,ArtifactState::FREE, -1, false};
+
+    assign_loot_to_enemy(WPN_SOLAR_CORE, g_seed);
+    assign_loot_to_enemy(WPN_LUNAR_BLADE, g_seed);
 
     for (int i = 0; i < MAX_ENTITIES; i++) gs->waiting_for[i] = WPN_NONE;
 }
@@ -218,6 +231,35 @@ static void artifact_on_remove(int entity_idx, WeaponID wpn)
     game_log(buf);
 }
 
+static int random_enemy_index(unsigned &seed)
+{
+    if (gs->num_enemies <= 0) return -1;
+    return gs->num_players + rng_range(seed, 0, gs->num_enemies - 1);
+}
+
+static void assign_loot_to_enemy(WeaponID wpn, unsigned &seed)
+{
+    if (gs->num_enemies <= 0) return;
+    int enemy_idx = random_enemy_index(seed);
+    if (enemy_idx < 0) return;
+
+    if (gs->entities[enemy_idx].held_loot != WPN_NONE && gs->num_enemies > 1) {
+        for (int i = 0; i < gs->num_enemies; ++i) {
+            int candidate = gs->num_players + rng_range(seed, 0, gs->num_enemies - 1);
+            if (gs->entities[candidate].held_loot == WPN_NONE) {
+                enemy_idx = candidate;
+                break;
+            }
+        }
+    }
+
+    gs->entities[enemy_idx].held_loot = wpn;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s begins the battle carrying %s as guaranteed loot.",
+             gs->entities[enemy_idx].name, weapon_def(wpn).name);
+    game_log(buf);
+}
+
 // Execute the selected action for the active entity.
 static void apply_action(int actor_idx, const Action &act)
 {
@@ -292,8 +334,15 @@ static void deliver_stun(int target_idx)
 {
     Entity &tgt = gs->entities[target_idx];
     tgt.stunned = true;
-    pid_t pid = tgt.pid;
-    if (pid > 0) kill(pid, SIGUSR1);
+    if (gs->num_hip_procs > 0) {
+        for (int i = 0; i < gs->num_hip_procs; ++i) {
+            pid_t pid = gs->hip_pids[i];
+            if (pid > 0) kill(pid, SIGUSR1);
+        }
+    } else {
+        pid_t pid = gs->hip_pid;
+        if (pid > 0) kill(pid, SIGUSR1);
+    }
     char buf[128];
     snprintf(buf, sizeof(buf), "%s is STUNNED for %d seconds!", tgt.name, STUN_DURATION);
     game_log(buf);
@@ -428,7 +477,7 @@ static void arbiter_main_loop()
         gs->npc_submitted = false; actor.action_ready = false; actor.action_done = false;
         sem_post(&gs->state_mutex);
 
-        if (actor.type == EntityType::PLAYER) sem_post(&gs->hip_turn_sem);
+        if (actor.type == EntityType::PLAYER) notify_hip_processes();
         else sem_post(&gs->asp_turn_sem);
 
         if (actor.type == EntityType::PLAYER) {
@@ -482,17 +531,58 @@ static void arbiter_main_loop()
                             artifact_on_remove(i, w);
                 }
 
-                static const WeaponID DROP_TABLE[] = {
-                    WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_IRON_HALBERD,
-                    WPN_FROSTBOW, WPN_OBSIDIAN_AXE, WPN_THUNDERSTAFF};
-                bool enemy_held = false;
-                for (int s2 = 0; s2 < INVENTORY_SLOTS; ++s2)
-                    if (en.inventory.slots[s2] != WPN_NONE) { enemy_held = true; break; }
-
-                if (!enemy_held && rng_range(g_seed, 1, 10) <= 3 && !gs->pending_drop_ready) {
+                if (en.held_loot != WPN_NONE && !gs->pending_drop_ready) {
+                    WeaponID drop = en.held_loot;
+                    en.held_loot = WPN_NONE;
                     int offer_to = ready;
-                    if (gs->entities[offer_to].type != EntityType::PLAYER)
-                    {
+                    if (gs->entities[offer_to].type != EntityType::PLAYER) {
+                        offer_to = 0;
+                        for (int p = 0; p < gs->num_players; ++p)
+                            if (gs->entities[p].alive) { offer_to = p; break; }
+                    }
+                    sem_wait(&gs->state_mutex);
+                    gs->pending_drop_wpn = drop; gs->pending_drop_for = offer_to;
+                    gs->pending_drop_ready = true; gs->pending_drop_done = false; gs->pending_drop_taken = false;
+                    sem_post(&gs->state_mutex);
+                    snprintf(buf, sizeof(buf), "%s dropped a %s! (guaranteed artifact drop)", en.name, weapon_def(drop).name);
+                    game_log(buf);
+
+                    struct timespec dl{};
+                    clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 30;
+                    while (!gs->pending_drop_done) {
+                        struct timespec ns{0, 20000000}; nanosleep(&ns, nullptr);
+                        struct timespec now{}; clock_gettime(CLOCK_REALTIME, &now);
+                        if (now.tv_sec >= dl.tv_sec) break;
+                    }
+
+                    if (gs->pending_drop_taken) {
+                        if (inv_pickup(gs->entities[offer_to], drop))
+                            artifact_on_pickup(offer_to, drop);
+                        snprintf(buf, sizeof(buf), "%s picked up %s!", gs->entities[offer_to].name, weapon_def(drop).name);
+                    } else {
+                        for (int e2 = gs->num_players; e2 < gs->total_entities; ++e2) {
+                            if (gs->entities[e2].alive) {
+                                if (inv_pickup(gs->entities[e2], drop))
+                                    artifact_on_pickup(e2, drop);
+                                snprintf(buf, sizeof(buf), "An enemy picked up %s!", weapon_def(drop).name);
+                                break;
+                            }
+                        }
+                    }
+                    game_log(buf);
+                    sem_wait(&gs->state_mutex); gs->pending_drop_ready = false; sem_post(&gs->state_mutex);
+                } else {
+                    static const WeaponID DROP_TABLE[] = {
+                        WPN_SPLINTER_STICK, WPN_VENOM_DAGGER, WPN_IRON_HALBERD,
+                        WPN_FROSTBOW, WPN_OBSIDIAN_AXE, WPN_THUNDERSTAFF};
+                    bool enemy_held = false;
+                    for (int s2 = 0; s2 < INVENTORY_SLOTS; ++s2)
+                        if (en.inventory.slots[s2] != WPN_NONE) { enemy_held = true; break; }
+
+                    if (!enemy_held && rng_range(g_seed, 1, 10) <= 3 && !gs->pending_drop_ready) {
+                        int offer_to = ready;
+                        if (gs->entities[offer_to].type != EntityType::PLAYER)
+                        {
                         offer_to = 0;
                         for (int p = 0; p < gs->num_players; ++p)
                             if (gs->entities[p].alive) { offer_to = p; break; }
@@ -514,13 +604,14 @@ static void arbiter_main_loop()
                     }
 
                     if (gs->pending_drop_taken) {
-                        inv_pickup(gs->entities[offer_to], drop);
-                        artifact_on_pickup(offer_to, drop);
+                        if (inv_pickup(gs->entities[offer_to], drop))
+                            artifact_on_pickup(offer_to, drop);
                         snprintf(buf, sizeof(buf), "%s picked up %s!", gs->entities[offer_to].name, weapon_def(drop).name);
                     } else {
                         for (int e2 = gs->num_players; e2 < gs->total_entities; ++e2) {
                             if (gs->entities[e2].alive) {
-                                inv_pickup(gs->entities[e2], drop);
+                                if (inv_pickup(gs->entities[e2], drop))
+                                    artifact_on_pickup(e2, drop);
                                 snprintf(buf, sizeof(buf), "An enemy picked up %s!", weapon_def(drop).name);
                                 break;
                             }
@@ -536,7 +627,7 @@ static void arbiter_main_loop()
         nanosleep(&tick, nullptr);
     }
 }
-
+}
 
 static const unsigned WIN_W = 1100;
 static const unsigned WIN_H = 780;
@@ -804,13 +895,13 @@ static void *render_thread_fn(void *)
             sf::Text mt(msg,font,56); mt.setFillColor(mc); mt.setStyle(sf::Text::Bold);
             sf::FloatRect mb=mt.getLocalBounds(); mt.setOrigin(mb.width/2.f,mb.height/2.f);
             mt.setPosition(WIN_W/2.f,WIN_H/2.f-30.f); window.draw(mt);
-            sf::Text sub("Window will close in a moment...",font,18); sub.setFillColor(C_WHITE);
+            sf::Text sub("Closing in 3.5 seconds...",font,18); sub.setFillColor(C_WHITE);
             sf::FloatRect sb=sub.getLocalBounds(); sub.setOrigin(sb.width/2.f,sb.height/2.f);
             sub.setPosition(WIN_W/2.f,WIN_H/2.f+40.f); window.draw(sub);
         }
 
         window.display();
-        if (snap.phase == GamePhase::GAME_OVER) { sf::sleep(sf::seconds(3.f)); window.close(); }
+        if (snap.phase == GamePhase::GAME_OVER) { sf::sleep(sf::seconds(3.5f)); window.close(); }
     }
 
     if (window.isOpen()) window.close();
@@ -820,10 +911,16 @@ static void *render_thread_fn(void *)
 // Start arbiter shared memory, threads, and game loop.
 int arbiter_main(int argc, char *argv[])
 {
-    if (argc < 3) { fprintf(stderr, "Usage : arbiter <roll_number> <num_players>\n"); return 1; }
+    bool launch_hip = true;
+    int argi = 1;
+    if (argc >= 2 && strcmp(argv[1], "--no-hip") == 0) {
+        launch_hip = false;
+        argi = 2;
+    }
+    if (argc - argi < 2) { fprintf(stderr, "Usage : arbiter_bin [--no-hip] <roll_number> <num_players>\n"); return 1; }
 
-    unsigned roll_no = (unsigned)atoi(argv[1]);
-    int num_players = atoi(argv[2]);
+    unsigned roll_no = (unsigned)atoi(argv[argi]);
+    int num_players = atoi(argv[argi + 1]);
     if (num_players < 1) num_players = 1;
     if (num_players > 4) num_players = 4;
 
@@ -847,9 +944,18 @@ int arbiter_main(int argc, char *argv[])
     snprintf(roll_str, sizeof(roll_str), "%u", roll_no);
     snprintf(np_str,   sizeof(np_str),   "%d", num_players);
 
-    g_hip_pid = fork();
-    if (g_hip_pid == 0) { execlp("./hip_bin","./hip_bin",roll_str,np_str,nullptr); perror("exec hip"); _exit(1); }
-    gs->hip_pid = g_hip_pid;
+    if (launch_hip) {
+        g_hip_pid = fork();
+        if (g_hip_pid == 0) { execlp("./hip_bin","./hip_bin",roll_str,np_str,nullptr); perror("exec hip"); _exit(1); }
+        gs->hip_pid = g_hip_pid;
+        gs->num_hip_procs = 1;
+        gs->hip_pids[0] = g_hip_pid;
+    } else {
+        printf("[Arbiter] hip_bin auto-launch disabled. Start ./hip_bin %u %d in another terminal.\n", roll_no, num_players);
+        fflush(stdout);
+        gs->hip_pid = 0;
+        gs->num_hip_procs = 0;
+    }
 
     char ne_str[8]; snprintf(ne_str, sizeof(ne_str), "%d", num_enemies);
     g_asp_pid = fork();
@@ -859,9 +965,15 @@ int arbiter_main(int argc, char *argv[])
     arbiter_main_loop();
 
     g_quit = 1; g_render_done = 1;
-    if (g_hip_pid > 0) kill(g_hip_pid, SIGTERM);
-    if (g_asp_pid > 0) { kill(g_asp_pid, SIGCONT); kill(g_asp_pid, SIGTERM); }
-    waitpid(g_hip_pid, nullptr, 0); waitpid(g_asp_pid, nullptr, 0);
+    if (g_hip_pid > 0) {
+        kill(g_hip_pid, SIGTERM);
+        waitpid(g_hip_pid, nullptr, 0);
+    } else if (gs->num_hip_procs > 0) {
+        for (int i = 0; i < gs->num_hip_procs; ++i) {
+            if (gs->hip_pids[i] > 0) kill(gs->hip_pids[i], SIGTERM);
+        }
+    }
+    if (g_asp_pid > 0) { kill(g_asp_pid, SIGCONT); kill(g_asp_pid, SIGTERM); waitpid(g_asp_pid, nullptr, 0); }
     pthread_join(render_tid, nullptr); pthread_join(dl_tid, nullptr);
 
     sem_destroy(&gs->state_mutex); sem_destroy(&gs->action_sem);

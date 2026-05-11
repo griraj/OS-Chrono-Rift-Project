@@ -120,6 +120,7 @@ struct Entity
 
     Inventory inventory;
     LongTermStorage lts;
+    WeaponID held_loot = WPN_NONE;
 
     Action pending_action;
     bool action_ready = false;
@@ -188,6 +189,8 @@ struct SharedState
 
     volatile bool render_ready = false;
 
+    int num_hip_procs = 0;
+    pid_t hip_pids[MAX_PLAYERS] = {};
     pid_t arbiter_pid = 0;
     pid_t hip_pid = 0;
     pid_t asp_pid = 0;

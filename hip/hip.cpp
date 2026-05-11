@@ -22,6 +22,7 @@
 
 static SharedState* gs = nullptr;
 static int g_num_players = 0;
+static int g_my_player = -1;
 static volatile sig_atomic_t g_quit = 0;
 static volatile sig_atomic_t g_stunned = 0;
 static sem_t player_sem[MAX_PLAYERS];
@@ -65,6 +66,16 @@ static SharedState *shm_open_existing()
     close(fd);
     return static_cast<SharedState *>(p);
 }
+
+static void register_hip_process()
+{
+    sem_wait(&gs->state_mutex);
+    if (gs->num_hip_procs < MAX_PLAYERS) {
+        gs->hip_pids[gs->num_hip_procs++] = getpid();
+    }
+    sem_post(&gs->state_mutex);
+}
+
 static const unsigned WW = 900, WH = 700;
 static const sf::Color BG{8, 10, 20};
 static const sf::Color PANEL{16, 18, 38};
@@ -328,7 +339,16 @@ void handle_esc()
 void draw_picking(sf::RenderWindow &win)
     {
         win.clear(BG); Grid(win);
-        sem_wait(&gs->state_mutex); memcpy(ents, gs->entities, sizeof(ents)); sem_post(&gs->state_mutex);
+        sem_wait(&gs->state_mutex);
+        memcpy(ents, gs->entities, sizeof(ents));
+        me = gs->entities[pidx];
+        sem_post(&gs->state_mutex);
+
+        enemy_btns.clear();
+        float enemy_y = 238.f;
+        for (int i = np; i < nte; i++)
+            if (ents[i].alive) { enemy_btns.push_back({{400.f, enemy_y, WW - 420.f, 38.f}, i}); enemy_y += 44.f; }
+
         sf::Vector2f ms = win.mapPixelToCoords(sf::Mouse::getPosition(win));
         {
             float p = 0.5f + 0.5f * sinf(clock_t * 2.f);
@@ -490,17 +510,27 @@ static void *dispatcher(void *)
         if (g_quit) break;
         int ct = gs->current_turn;
         if (ct >= 0 && ct < gs->num_players && gs->entities[ct].alive)
-            sem_post(&player_sem[ct]);
+        {
+            if (g_my_player < 0 || ct == g_my_player)
+                sem_post(&player_sem[ct]);
+        }
     }
     return nullptr;
 }
 // Launch the arbiter binary with seed and player count.
 int main(int argc, char *argv[])
 {
-    if (argc < 3) { fprintf(stderr, "Usage: hip <roll_no> <num_players>\n"); return 1; }
+    if (argc < 3) { fprintf(stderr, "Usage: hip <roll_no> <num_players> [player_index]\n"); return 1; }
     g_num_players = atoi(argv[2]);
+    if (argc >= 4) {
+        g_my_player = atoi(argv[3]);
+        if (g_my_player < 0 || g_my_player >= g_num_players) {
+            fprintf(stderr, "Usage: hip <roll_no> <num_players> [player_index]\n");
+            return 1;
+        }
+    }
     gs = shm_open_existing();
-
+    register_hip_process();
 
 
     while (!gs->render_ready && !g_quit)
@@ -510,7 +540,11 @@ int main(int argc, char *argv[])
     sa.sa_handler = sig_term; sigaction(SIGTERM, &sa, nullptr);
     sa.sa_handler = sig_stun; sigaction(SIGUSR1, &sa, nullptr);
     sem_init(&g_ui_req_sem, 0, 0); sem_init(&g_ui_done_sem, 0, 0);
-    for (int i = 0; i < g_num_players; i++) sem_init(&player_sem[i], 0, 0);
+    if (g_my_player >= 0) {
+        sem_init(&player_sem[g_my_player], 0, 0);
+    } else {
+        for (int i = 0; i < g_num_players; i++) sem_init(&player_sem[i], 0, 0);
+    }
 
     sf::RenderWindow win(sf::VideoMode(WW, WH), "Chrono Rift - Player Actions",
                          sf::Style::Titlebar | sf::Style::Close);
@@ -526,8 +560,12 @@ int main(int argc, char *argv[])
     HipUI ui; ui.load_font();
     pthread_t disp_tid; pthread_create(&disp_tid, nullptr, dispatcher, nullptr);
     pthread_t ptids[MAX_PLAYERS];
-    for (int i = 0; i < g_num_players; i++)
-    { auto *a = new PlayerArg{i}; pthread_create(&ptids[i], nullptr, player_thread, a); }
+    if (g_my_player >= 0) {
+        auto *a = new PlayerArg{g_my_player}; pthread_create(&ptids[g_my_player], nullptr, player_thread, a);
+    } else {
+        for (int i = 0; i < g_num_players; i++)
+        { auto *a = new PlayerArg{i}; pthread_create(&ptids[i], nullptr, player_thread, a); }
+    }
     sf::Clock clk;
     while (!g_quit && gs->phase != GamePhase::GAME_OVER && win.isOpen())
     {
@@ -653,11 +691,20 @@ int main(int argc, char *argv[])
     }
     if (win.isOpen()) win.close();
     g_quit=1;
-    for (int i=0;i<g_num_players;i++) sem_post(&player_sem[i]);
+    if (g_my_player >= 0) {
+        sem_post(&player_sem[g_my_player]);
+    } else {
+        for (int i=0;i<g_num_players;i++) sem_post(&player_sem[i]);
+    }
     sem_post(&gs->hip_turn_sem); sem_post(&g_ui_req_sem); sem_post(&g_ui_done_sem);
     pthread_join(disp_tid, nullptr);
-    for (int i=0;i<g_num_players;i++) pthread_join(ptids[i],nullptr);
-    for (int i=0;i<g_num_players;i++) sem_destroy(&player_sem[i]);
+    if (g_my_player >= 0) {
+        pthread_join(ptids[g_my_player],nullptr);
+        sem_destroy(&player_sem[g_my_player]);
+    } else {
+        for (int i=0;i<g_num_players;i++) pthread_join(ptids[i],nullptr);
+        for (int i=0;i<g_num_players;i++) sem_destroy(&player_sem[i]);
+    }
     sem_destroy(&g_ui_req_sem); sem_destroy(&g_ui_done_sem);
     munmap(gs, sizeof(SharedState));
     return 0;

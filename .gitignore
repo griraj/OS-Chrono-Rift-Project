@@ -1,0 +1,8 @@
+cd /mnt/c/Users/mohit/OneDrive/Desktop/chrono_rift
+echo "arbiter.cpp" >> .gitignore
+echo "hip_bin" >> .gitignore
+echo "asp_bin" >> .gitignore
+echo "arbiter.o" >> .gitignore
+echo "hip.o" >> .gitignore
+echo "*.o" >> .gitignore
+echo "background.png" >> .gitignore
