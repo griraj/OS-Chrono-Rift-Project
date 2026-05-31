@@ -136,7 +136,7 @@ You will see:
 2. **Launcher** — green-shaded rectangle card to enter Roll Number and Party Size
 3. **Game window** — SFML HUD with pixel-art player/enemy sprites, HP/stamina bars, artifact table, action log
 
-**Player input** is done via the HIP window (click actions and targets).
+**Player input** is done via the HIP window .
 
 ---
 
